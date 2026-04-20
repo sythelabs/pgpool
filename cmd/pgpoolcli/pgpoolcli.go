@@ -31,6 +31,9 @@ const (
 	httpTimeout       = 60 * time.Second
 )
 
+// cliVersion is set at link time via -ldflags "-X main.cliVersion=..."
+var cliVersion = "dev"
+
 // claudeSegment is what `pgpoolcli init` appends to CLAUDE.md.
 const claudeSegment = `<!-- BEGIN PGPOOL INTEGRATION v:1 -->
 ## Postgres Pool (pgpool)
@@ -617,6 +620,9 @@ func main() {
 		return
 	case "prime":
 		fmt.Print(primeText)
+		return
+	case "-v", "--version", "version":
+		fmt.Printf("pgpoolcli %s\n", cliVersion)
 		return
 	}
 
