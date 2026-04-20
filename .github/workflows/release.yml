@@ -1,0 +1,113 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
+
+          OUTDIR="dist/pgpool-${VERSION}-${GOOS}-${GOARCH}"
+          mkdir -p "$OUTDIR"
+
+          go build -trimpath \
+            -ldflags "-s -w -X main.serverVersion=${VERSION}" \
+            -o "${OUTDIR}/pgpool${EXT}" ./cmd/pgpool
+
+          go build -trimpath \
+            -ldflags "-s -w -X main.cliVersion=${VERSION}" \
+            -o "${OUTDIR}/pgpoolcli${EXT}" ./cmd/pgpoolcli
+
+          cp README.md "${OUTDIR}/"
+
+      - name: archive
+        id: archive
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          BASENAME="pgpool-${VERSION}-${GOOS}-${GOARCH}"
+          cd dist
+          if [ "$GOOS" = "windows" ]; then
+            zip -r "${BASENAME}.zip" "${BASENAME}"
+            echo "asset=dist/${BASENAME}.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "${BASENAME}.tar.gz" "${BASENAME}"
+            echo "asset=dist/${BASENAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pgpool-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ steps.archive.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum pgpool-*.tar.gz pgpool-*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --generate-notes \
+            dist/pgpool-*.tar.gz dist/pgpool-*.zip dist/SHA256SUMS

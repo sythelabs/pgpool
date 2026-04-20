@@ -1,0 +1,128 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>pgpool</title>
+</head>
+<body>
+
+<h1>pgpool</h1>
+
+<section>
+  <h2>up</h2>
+  <form id="up-form">
+    <label>repo <input name="repo" required></label>
+    <label>worktree <input name="worktree" required></label>
+    <label>image (optional) <input name="image"></label>
+    <button type="submit">up</button>
+  </form>
+  <pre id="up-out"></pre>
+</section>
+
+<hr>
+
+<section>
+  <h2>down</h2>
+  <form id="down-form">
+    <label>repo <input name="repo" required></label>
+    <label>worktree <input name="worktree" required></label>
+    <button type="submit">down</button>
+  </form>
+  <pre id="down-out"></pre>
+</section>
+
+<hr>
+
+<section>
+  <h2>status</h2>
+  <form id="status-form">
+    <label>repo <input name="repo" required></label>
+    <label>worktree <input name="worktree" required></label>
+    <button type="submit">status</button>
+  </form>
+  <pre id="status-out"></pre>
+</section>
+
+<hr>
+
+<section>
+  <h2>list</h2>
+  <button id="list-btn">refresh</button>
+  <pre id="list-out"></pre>
+</section>
+
+<script>
+function show(id, data) {
+  document.getElementById(id).textContent =
+    typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+}
+
+async function postJSON(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: {'content-type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  return r.json();
+}
+
+async function getJSON(path) {
+  const r = await fetch(path);
+  return r.json();
+}
+
+function formBody(form) {
+  const fd = new FormData(form);
+  const body = {};
+  for (const [k, v] of fd.entries()) {
+    if (v !== '') body[k] = v;
+  }
+  return body;
+}
+
+document.getElementById('up-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  show('up-out', 'running...');
+  try {
+    show('up-out', await postJSON('/v1/up', formBody(e.target)));
+  } catch (err) {
+    show('up-out', String(err));
+  }
+});
+
+document.getElementById('down-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  show('down-out', 'running...');
+  try {
+    show('down-out', await postJSON('/v1/down', formBody(e.target)));
+  } catch (err) {
+    show('down-out', String(err));
+  }
+});
+
+document.getElementById('status-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  show('status-out', 'running...');
+  const b = formBody(e.target);
+  const q = new URLSearchParams(b).toString();
+  try {
+    show('status-out', await getJSON('/v1/status?' + q));
+  } catch (err) {
+    show('status-out', String(err));
+  }
+});
+
+document.getElementById('list-btn').addEventListener('click', async () => {
+  show('list-out', 'loading...');
+  try {
+    show('list-out', await getJSON('/v1/list'));
+  } catch (err) {
+    show('list-out', String(err));
+  }
+});
+
+document.getElementById('list-btn').click();
+</script>
+
+</body>
+</html>
