@@ -8,10 +8,36 @@ It gets really annoying when they all try to spin up docker.
 
 See `CLAUDE.md` for the full server spec. What follows is how to use it.
 
-## Build
+## Install
+
+One-liner - grabs the latest release from GitHub and installs both `pgpool` and
+`pgpoolcli` into `/usr/local/bin`:
 
 ```
-go build -o pgpool .
+curl -fsSL https://raw.githubusercontent.com/sythelabs/pgpool/main/install.sh | sh
+```
+
+Linux and macOS, amd64 and arm64. The script resolves the latest tag via the
+GitHub releases API, downloads the matching `.tar.gz`, and installs both
+binaries. It uses `sudo` only if the install dir is not writable.
+
+Overrides:
+
+```
+# pin a specific version
+curl -fsSL https://raw.githubusercontent.com/sythelabs/pgpool/main/install.sh | PGPOOL_VERSION=v1.2.3 sh
+
+# install into a user-owned dir (no sudo)
+curl -fsSL https://raw.githubusercontent.com/sythelabs/pgpool/main/install.sh | INSTALL_DIR="$HOME/.local/bin" sh
+```
+
+Windows users: grab the `.zip` from the
+[releases page](https://github.com/sythelabs/pgpool/releases/latest).
+
+## Build from source
+
+```
+go build -o pgpool ./cmd/pgpool
 go build -o pgpoolcli ./cmd/pgpoolcli
 ```
 
