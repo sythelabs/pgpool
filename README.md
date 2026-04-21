@@ -2,7 +2,9 @@
 
 Single-binary server that manages ephemeral PostgreSQL containers on its host,
 plus a thin CLI (`pgpoolcli`) for clients. Clients speak HTTP (REST or MCP
-JSON-RPC); the server shells out to `docker`.
+JSON-RPC); the server shells out to `docker`. This system is designed for
+multi-agent workflows where you have lots of agents thrashing on features.
+It gets really annoying when they all try to spin up docker.
 
 See `CLAUDE.md` for the full server spec. What follows is how to use it.
 
