@@ -283,6 +283,7 @@ func (s *Server) containerRemove(ctx context.Context, name string) error {
 }
 
 type runOpts struct {
+	def                      ServiceDef
 	container, volume, image string
 	repo, worktree           string
 }
@@ -292,16 +293,18 @@ func (s *Server) containerRun(ctx context.Context, o runOpts) error {
 		"run", "-d",
 		"--name", o.container,
 		"--restart", "unless-stopped",
-		"-p", "0:5432",
-		"-v", o.volume + ":/var/lib/postgresql/data",
-		"-e", "POSTGRES_PASSWORD=" + s.cfg.PgPassword,
-		"-e", "POSTGRES_USER=" + s.cfg.PgUser,
-		"-e", "POSTGRES_DB=" + s.cfg.PgDB,
-		"--label", labelPgpool + "=true",
-		"--label", labelRepo + "=" + o.repo,
-		"--label", labelWorktree + "=" + o.worktree,
-		o.image,
 	}
+	for _, e := range o.def.Endpoints {
+		args = append(args, "-p", fmt.Sprintf("0:%d", e.ContainerPort))
+	}
+	args = append(args, o.def.DockerArgs(s.cfg, o.volume)...)
+	args = append(args,
+		"--label", labelPgpool+"=true",
+		"--label", labelRepo+"="+o.repo,
+		"--label", labelWorktree+"="+o.worktree,
+		"--label", labelService+"="+o.def.Type,
+		o.image,
+	)
 	_, errOut, err := s.runDocker(ctx, args...)
 	if err != nil {
 		return fmt.Errorf("docker run %s: %w: %s", o.container, err, strings.TrimSpace(errOut))
@@ -459,6 +462,7 @@ func (s *Server) opUp(ctx context.Context, req UpRequest) (*UpResponse, error) {
 			return nil, err
 		}
 		runErr := s.containerRun(ctx, runOpts{
+			def:       postgresDef,
 			container: cname, volume: vname, image: image,
 			repo: normalize(req.Repo), worktree: normalize(req.Worktree),
 		})
