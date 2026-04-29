@@ -57,6 +57,36 @@ type ServiceDef struct {
 
 var serviceDefs = map[string]ServiceDef{}
 
+var postgresDef = ServiceDef{
+	Type:            "postgres",
+	ContainerPrefix: "pg",
+	VolumePrefix:    "pgvol",
+	Image:           "postgres:17",
+	DockerArgs: func(cfg Config, volume string) []string {
+		return []string{
+			"-v", volume + ":/var/lib/postgresql/data",
+			"-e", "POSTGRES_PASSWORD=" + cfg.PgPassword,
+			"-e", "POSTGRES_USER=" + cfg.PgUser,
+			"-e", "POSTGRES_DB=" + cfg.PgDB,
+		}
+	},
+	Endpoints: []EndpointSpec{
+		{Role: "primary", ContainerPort: 5432, Scheme: "postgresql"},
+	},
+	Readiness: func(ctx context.Context, s *Server, container string, _ map[string]string) error {
+		return s.pgIsReady(ctx, container)
+	},
+	BuildURL: func(cfg Config, role, hostPort string) string {
+		pw := url.QueryEscape(cfg.PgPassword)
+		return fmt.Sprintf("postgresql://%s:%s@%s:%s/%s",
+			cfg.PgUser, pw, cfg.AdvertiseHost, hostPort, cfg.PgDB)
+	},
+}
+
+func init() {
+	serviceDefs[postgresDef.Type] = postgresDef
+}
+
 // serverVersion is set at link time via -ldflags "-X main.serverVersion=..."
 var serverVersion = "dev"
 
