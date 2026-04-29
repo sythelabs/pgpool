@@ -171,3 +171,28 @@ func TestParseServicesCSV(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveServices(t *testing.T) {
+	s := &Server{cfg: Config{DefaultServices: []string{"postgres"}}}
+
+	got, err := s.resolveServices(nil)
+	if err != nil || len(got) != 1 || got[0].Type != "postgres" {
+		t.Errorf("default fallback failed: %v %v", got, err)
+	}
+
+	got, err = s.resolveServices([]string{"postgres"})
+	if err != nil || len(got) != 1 {
+		t.Errorf("explicit single failed: %v %v", got, err)
+	}
+
+	_, err = s.resolveServices([]string{"nope"})
+	if err == nil {
+		t.Error("expected error for unknown service")
+	}
+
+	empty := &Server{cfg: Config{DefaultServices: nil}}
+	_, err = empty.resolveServices(nil)
+	if err == nil {
+		t.Error("expected error when no defaults and no request")
+	}
+}
