@@ -49,7 +49,8 @@ type ServiceDef struct {
 	ContainerPrefix string
 	VolumePrefix    string
 	Image           string
-	DockerArgs      func(cfg Config, volume string) []string
+	DockerArgs      func(cfg Config, volume string) []string  // flags placed BEFORE the image
+	DockerCommand   func(cfg Config) []string                 // args placed AFTER the image (the container CMD)
 	Endpoints       []EndpointSpec
 	Readiness       func(ctx context.Context, s *Server, container string, hostPorts map[string]string) error
 	BuildURL        func(cfg Config, role string, hostPort string) string
@@ -89,6 +90,35 @@ var postgresDef = ServiceDef{
 
 func init() {
 	serviceDefs[postgresDef.Type] = postgresDef
+}
+
+var seaweedfsDef = ServiceDef{
+	Type:            "seaweedfs",
+	ContainerPrefix: "weed",
+	VolumePrefix:    "weedvol",
+	Image:           "chrislusf/seaweedfs:3.71",
+	DockerArgs: func(_ Config, volume string) []string {
+		return []string{"-v", volume + ":/data"}
+	},
+	DockerCommand: func(_ Config) []string {
+		return []string{"server", "-dir=/data", "-master", "-volume", "-filer", "-s3"}
+	},
+	Endpoints: []EndpointSpec{
+		{Role: "master", ContainerPort: 9333, Scheme: "http"},
+		{Role: "volume", ContainerPort: 8080, Scheme: "http"},
+		{Role: "filer", ContainerPort: 8888, Scheme: "http"},
+		{Role: "s3", ContainerPort: 8333, Scheme: "http"},
+	},
+	Readiness: func(ctx context.Context, s *Server, container string, hostPorts map[string]string) error {
+		return s.httpReady(ctx, "http://"+s.cfg.AdvertiseHost+":"+hostPorts["master"]+"/cluster/status")
+	},
+	BuildURL: func(cfg Config, role, hostPort string) string {
+		return fmt.Sprintf("http://%s:%s", cfg.AdvertiseHost, hostPort)
+	},
+}
+
+func init() {
+	serviceDefs[seaweedfsDef.Type] = seaweedfsDef
 }
 
 // ---------- endpoint helpers ----------
@@ -332,13 +362,39 @@ func (s *Server) containerRun(ctx context.Context, o runOpts) error {
 		"--label", labelRepo+"="+o.repo,
 		"--label", labelWorktree+"="+o.worktree,
 		"--label", labelService+"="+o.def.Type,
-		o.image,
 	)
+	args = append(args, o.image)
+	if o.def.DockerCommand != nil {
+		args = append(args, o.def.DockerCommand(s.cfg)...)
+	}
 	_, errOut, err := s.runDocker(ctx, args...)
 	if err != nil {
 		return fmt.Errorf("docker run %s: %w: %s", o.container, err, strings.TrimSpace(errOut))
 	}
 	return nil
+}
+
+func (s *Server) httpReady(ctx context.Context, url string) error {
+	deadline := time.Now().Add(s.cfg.StartupTimeout)
+	client := &http.Client{Timeout: 3 * time.Second}
+	for {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("http readiness probe %s timed out after %s", url, s.cfg.StartupTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 func (s *Server) pgIsReady(ctx context.Context, container string) error {

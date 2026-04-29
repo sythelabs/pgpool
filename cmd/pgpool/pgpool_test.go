@@ -172,6 +172,20 @@ func TestParseServicesCSV(t *testing.T) {
 	}
 }
 
+func TestSeaweedfs_HasDockerCommand(t *testing.T) {
+	def, ok := serviceDefs["seaweedfs"]
+	if !ok {
+		t.Fatal("seaweedfs not registered")
+	}
+	if def.DockerCommand == nil {
+		t.Fatal("seaweedfs DockerCommand is nil")
+	}
+	cmd := def.DockerCommand(Config{})
+	if len(cmd) == 0 || cmd[0] != "server" {
+		t.Errorf("unexpected command: %v", cmd)
+	}
+}
+
 func TestResolveServices(t *testing.T) {
 	s := &Server{cfg: Config{DefaultServices: []string{"postgres"}}}
 
