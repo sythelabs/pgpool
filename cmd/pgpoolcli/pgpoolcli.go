@@ -27,7 +27,7 @@ import (
 const (
 	defaultURL        = "http://localhost:8080"
 	defaultConfigRel  = ".config/pgpool/pgpool.json"
-	claudeBeginMarker = "<!-- BEGIN PGPOOL INTEGRATION v:1 -->"
+	claudeBeginMarker = "<!-- BEGIN PGPOOL INTEGRATION v:2 -->"
 	claudeEndMarker   = "<!-- END PGPOOL INTEGRATION -->"
 	httpTimeout       = 60 * time.Second
 )
@@ -36,75 +36,81 @@ const (
 var cliVersion = "dev"
 
 // claudeSegment is what `pgpoolcli init` appends to CLAUDE.md.
-const claudeSegment = `<!-- BEGIN PGPOOL INTEGRATION v:1 -->
-## Postgres Pool (pgpool)
-This project uses **pgpoolcli** to manage ephemeral Postgres containers per worktree.
-Run ` + "`pgpoolcli prime`" + ` to see full workflow context and commands.
-### Quick Reference
+const claudeSegment = `<!-- BEGIN PGPOOL INTEGRATION v:2 -->
+## Per-worktree services (pgpool)
+This project uses **pgpoolcli** to manage ephemeral per-worktree services (Postgres and SeaweedFS supported today).
+Run ` + "`pgpoolcli prime`" + ` for full workflow context.
+### Quick reference
 ` + "```bash" + `
-pgpoolcli up                # Create or reuse a Postgres container for this worktree
-pgpoolcli status            # Show current state and connection URL
-pgpoolcli list              # List all pgpool-managed containers
-pgpoolcli down              # Destroy the container and its volume
+pgpoolcli up                  # bring up all configured services
+pgpoolcli up postgres         # just postgres
+pgpoolcli status              # show all services for this worktree
+pgpoolcli status seaweedfs    # filter to one service
+pgpoolcli list                # all pgpool-managed containers on the host
+pgpoolcli down                # tear everything down for this worktree
+pgpoolcli down postgres       # tear down only postgres
 ` + "```" + `
 Repo and worktree auto-detect from git. Override with ` + "`--repo`" + ` / ` + "`--worktree`" + `.
 ### Rules
-- Use ` + "`pgpoolcli`" + ` to manage per-worktree databases - do NOT hand-run ` + "`docker`" + ` commands against pgpool containers
-- ` + "`pgpoolcli up`" + ` is idempotent - safe to run multiple times, does not wipe data
-- ` + "`pgpoolcli down`" + ` destroys the volume - data is NOT recoverable
-- The server does not write ` + "`.env`" + ` files - read the URL from ` + "`up`" + `/` + "`status`" + ` and write your own
-- One container per (repo, worktree) pair - names are derived, not chosen
+- Use ` + "`pgpoolcli`" + ` to manage per-worktree services - do NOT hand-run ` + "`docker`" + ` commands against pgpool containers.
+- ` + "`pgpoolcli up`" + ` is per-service idempotent. Re-running brings up missing services and reuses existing ones.
+- ` + "`pgpoolcli down`" + ` destroys volumes - data is NOT recoverable.
+- The server does not write ` + "`.env`" + ` files - read endpoint URLs from ` + "`up`" + ` / ` + "`status`" + ` and write your own.
+- One container per (repo, worktree, service) tuple - names are derived, not chosen.
 <!-- END PGPOOL INTEGRATION -->`
 
 // primeText is what `pgpoolcli prime` prints. Gives an agent the full picture
 // in one shot.
-const primeText = `pgpoolcli - per-worktree Postgres management
+const primeText = `pgpoolcli - per-worktree service management
 
-Each (repo, worktree) pair gets one ephemeral Postgres container with its own
-volume. The server is stateless; all state lives in Docker. Auto-detection
-fills in repo and worktree from git when you do not pass them.
+Each (repo, worktree) pair gets one ephemeral container per registered service.
+Today's services: postgres, seaweedfs. The server is stateless; all state lives
+in Docker labels and volumes. Auto-detection fills in repo and worktree from
+git when you do not pass them.
 
 Commands:
-  pgpoolcli up       [--repo R] [--worktree W] [--image IMG]
-    Create or reuse a container. Idempotent. Returns {container, volume, url,
-    host_port, reused}. Use the "url" as your DATABASE_URL.
+  pgpoolcli up [SERVICE...]
+    Bring up the listed services for this worktree, or all configured services
+    if no service is named. Idempotent. Returns one entry per service.
 
-  pgpoolcli status   [--repo R] [--worktree W]
-    Report state (missing | stopped | running) and current url if running.
+  pgpoolcli down [SERVICE...]
+    Destroy the listed services (or all configured services). NOT REVERSIBLE -
+    volumes are gone.
+
+  pgpoolcli status [SERVICE]
+    Report state for every configured service in this worktree, or just the
+    named service.
 
   pgpoolcli list
-    List every pgpool-managed container on the server's host.
-
-  pgpoolcli down     [--repo R] [--worktree W]
-    Destroy the container and its volume. NOT REVERSIBLE - data is gone.
+    Inventory of every pgpool-managed container on the server's host.
 
   pgpoolcli health
     Liveness check against the server.
 
   pgpoolcli config
-    Print the resolved config (url, config path, detected repo/worktree).
+    Print the resolved CLI config (url, config path, detected repo/worktree).
 
-  pgpoolcli init     [--url URL] [--force]
+  pgpoolcli init [--url URL] [--force]
     Write ~/.config/pgpool/pgpool.json and append the pgpool block to
-    ./CLAUDE.md if it is not already present.
+    ./CLAUDE.md if not already present.
 
   pgpoolcli prime
     Print this text.
 
 Global flags (apply to every subcommand):
-  --url URL          Server URL (env: PGPOOL_URL). Default from config file.
+  --url URL          Server URL (env: PGPOOL_URL).
   --config PATH      Config file path (env: PGPOOL_CONFIG).
-  --json             Print raw JSON response instead of a pretty summary.
+  --json             Print raw JSON instead of a human summary.
 
 Auto-detection:
   --repo      basename of the origin remote URL, else basename of the git toplevel
   --worktree  basename of the current working directory
 
 Typical flow inside a worktree:
-  1. pgpoolcli up                 (creates container, prints URL)
-  2. write URL into your .env     (the server does not do this for you)
-  3. work work work
-  4. pgpoolcli down               (when the worktree is done)
+  1. pgpoolcli up                # all services
+  2. read connection URLs from each service's "endpoints" map
+  3. write into your .env (the server does not do this for you)
+  4. pgpoolcli down              # when the worktree is done
 `
 
 // ---------- config ----------
