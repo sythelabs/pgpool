@@ -149,3 +149,25 @@ func TestServiceRegistry_Validity(t *testing.T) {
 		}
 	}
 }
+
+func TestParseServicesCSV(t *testing.T) {
+	cases := map[string][]string{
+		"postgres":              {"postgres"},
+		"postgres,seaweedfs":    {"postgres", "seaweedfs"},
+		" postgres , seaweedfs": {"postgres", "seaweedfs"},
+		"":                      {},
+		",,,":                   {},
+	}
+	for in, want := range cases {
+		got := parseServicesCSV(in)
+		if len(got) != len(want) {
+			t.Errorf("parseServicesCSV(%q) = %v, want %v", in, got, want)
+			continue
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("parseServicesCSV(%q)[%d] = %q, want %q", in, i, got[i], want[i])
+			}
+		}
+	}
+}

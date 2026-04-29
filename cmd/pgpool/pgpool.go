@@ -119,14 +119,15 @@ func buildEndpointInfo(cfg Config, def ServiceDef, hostPorts map[string]string) 
 var serverVersion = "dev"
 
 type Config struct {
-	ListenAddr     string
-	AdvertiseHost  string
-	PgImage        string
-	PgUser         string
-	PgPassword     string
-	PgDB           string
-	StartupTimeout time.Duration
-	DockerBin      string
+	ListenAddr      string
+	AdvertiseHost   string
+	PgImage         string
+	PgUser          string
+	PgPassword      string
+	PgDB            string
+	StartupTimeout  time.Duration
+	DockerBin       string
+	DefaultServices []string
 }
 
 type Server struct {
@@ -360,22 +361,309 @@ func (s *Server) pgIsReady(ctx context.Context, container string) error {
 	}
 }
 
-type ListedContainer struct {
-	Container string `json:"container"`
-	Repo      string `json:"repo"`
-	Worktree  string `json:"worktree"`
-	State     string `json:"state"`
-	URL       string `json:"url,omitempty"`
-	HostPort  string `json:"host_port,omitempty"`
-	CreatedAt string `json:"created_at"`
+type dockerPSRow struct {
+	ID        string `json:"ID"`
+	Names     string `json:"Names"`
+	Labels    string `json:"Labels"`
+	State     string `json:"State"`
+	CreatedAt string `json:"CreatedAt"`
 }
 
-type dockerPSRow struct {
-	ID      string `json:"ID"`
-	Names   string `json:"Names"`
-	Labels  string `json:"Labels"`
-	State   string `json:"State"`
-	CreatedAt string `json:"CreatedAt"`
+func parseDockerLabels(s string) map[string]string {
+	out := map[string]string{}
+	for _, kv := range strings.Split(s, ",") {
+		kv = strings.TrimSpace(kv)
+		if kv == "" {
+			continue
+		}
+		i := strings.Index(kv, "=")
+		if i < 0 {
+			continue
+		}
+		out[kv[:i]] = kv[i+1:]
+	}
+	return out
+}
+
+// ---------- service result types ----------
+
+type ServiceResult struct {
+	Type      string                  `json:"type"`
+	Container string                  `json:"container"`
+	Volume    string                  `json:"volume"`
+	State     string                  `json:"state,omitempty"`
+	CreatedAt string                  `json:"created_at,omitempty"`
+	Reused    bool                    `json:"reused,omitempty"`
+	Endpoints map[string]EndpointInfo `json:"endpoints,omitempty"`
+}
+
+// ---------- per-service primitives ----------
+
+func (s *Server) collectHostPorts(ctx context.Context, container string, def ServiceDef) (map[string]string, error) {
+	out := map[string]string{}
+	for _, e := range def.Endpoints {
+		hp, err := s.hostPort(ctx, container, e.ContainerPort)
+		if err != nil {
+			return nil, fmt.Errorf("%s: lookup %s host port: %w", def.Type, e.Role, err)
+		}
+		out[e.Role] = hp
+	}
+	return out, nil
+}
+
+func (s *Server) serviceUp(ctx context.Context, def ServiceDef, repo, worktree, imageOverride string) (ServiceResult, error) {
+	cname, err := serviceContainerName(def.ContainerPrefix, repo, worktree)
+	if err != nil {
+		return ServiceResult{}, err
+	}
+	vname, err := serviceVolumeName(def.VolumePrefix, repo, worktree)
+	if err != nil {
+		return ServiceResult{}, err
+	}
+	image := imageOverride
+	if image == "" {
+		image = def.Image
+	}
+
+	state, err := s.inspect(ctx, cname)
+	if err != nil {
+		return ServiceResult{}, err
+	}
+
+	reused := false
+	switch {
+	case state.Exists && state.Running:
+		reused = true
+	case state.Exists && !state.Running:
+		if err := s.containerStart(ctx, cname); err != nil {
+			return ServiceResult{}, err
+		}
+		hostPorts, err := s.collectHostPorts(ctx, cname, def)
+		if err != nil {
+			return ServiceResult{}, err
+		}
+		if err := def.Readiness(ctx, s, cname, hostPorts); err != nil {
+			tail := s.logsTail(ctx, cname, 50)
+			return ServiceResult{}, fmt.Errorf("%s: %w\nlast 50 log lines:\n%s", def.Type, err, tail)
+		}
+		reused = true
+	default:
+		if err := s.volumeCreate(ctx, vname); err != nil {
+			return ServiceResult{}, err
+		}
+		runErr := s.containerRun(ctx, runOpts{
+			def: def, container: cname, volume: vname, image: image,
+			repo: normalize(repo), worktree: normalize(worktree),
+		})
+		if runErr != nil {
+			if strings.Contains(runErr.Error(), "is already in use") {
+				state2, err2 := s.inspect(ctx, cname)
+				if err2 != nil {
+					return ServiceResult{}, err2
+				}
+				if !state2.Exists {
+					return ServiceResult{}, runErr
+				}
+				reused = true
+			} else {
+				return ServiceResult{}, runErr
+			}
+		}
+		if !reused {
+			hostPorts, err := s.collectHostPorts(ctx, cname, def)
+			if err != nil {
+				return ServiceResult{}, err
+			}
+			if err := def.Readiness(ctx, s, cname, hostPorts); err != nil {
+				tail := s.logsTail(ctx, cname, 50)
+				return ServiceResult{}, fmt.Errorf("%s: %w\nlast 50 log lines:\n%s", def.Type, err, tail)
+			}
+		}
+	}
+
+	hostPorts, err := s.collectHostPorts(ctx, cname, def)
+	if err != nil {
+		return ServiceResult{}, err
+	}
+	return ServiceResult{
+		Type:      def.Type,
+		Container: cname,
+		Volume:    vname,
+		Reused:    reused,
+		Endpoints: buildEndpointInfo(s.cfg, def, hostPorts),
+	}, nil
+}
+
+func (s *Server) serviceDown(ctx context.Context, def ServiceDef, repo, worktree string) (ServiceResult, error) {
+	cname, err := serviceContainerName(def.ContainerPrefix, repo, worktree)
+	if err != nil {
+		return ServiceResult{}, err
+	}
+	vname, err := serviceVolumeName(def.VolumePrefix, repo, worktree)
+	if err != nil {
+		return ServiceResult{}, err
+	}
+	if err := s.containerRemove(ctx, cname); err != nil {
+		return ServiceResult{}, err
+	}
+	if err := s.volumeRemove(ctx, vname); err != nil {
+		return ServiceResult{}, err
+	}
+	return ServiceResult{Type: def.Type, Container: cname, Volume: vname}, nil
+}
+
+func (s *Server) serviceStatus(ctx context.Context, def ServiceDef, repo, worktree string) (ServiceResult, error) {
+	cname, err := serviceContainerName(def.ContainerPrefix, repo, worktree)
+	if err != nil {
+		return ServiceResult{}, err
+	}
+	vname, err := serviceVolumeName(def.VolumePrefix, repo, worktree)
+	if err != nil {
+		return ServiceResult{}, err
+	}
+	state, err := s.inspect(ctx, cname)
+	if err != nil {
+		return ServiceResult{}, err
+	}
+	res := ServiceResult{Type: def.Type, Container: cname, Volume: vname}
+	if !state.Exists {
+		res.State = "missing"
+		return res, nil
+	}
+	res.CreatedAt = state.CreatedAt
+	if !state.Running {
+		res.State = "stopped"
+		return res, nil
+	}
+	res.State = "running"
+	hostPorts, err := s.collectHostPorts(ctx, cname, def)
+	if err != nil {
+		return ServiceResult{}, err
+	}
+	res.Endpoints = buildEndpointInfo(s.cfg, def, hostPorts)
+	return res, nil
+}
+
+// ---------- request/response types ----------
+
+type UpRequest struct {
+	Repo     string   `json:"repo"`
+	Worktree string   `json:"worktree"`
+	Services []string `json:"services,omitempty"`
+	Image    string   `json:"image,omitempty"` // optional, applies to postgres if present
+}
+
+type UpResponse struct {
+	Services []ServiceResult `json:"services"`
+}
+
+type DownRequest struct {
+	Repo     string   `json:"repo"`
+	Worktree string   `json:"worktree"`
+	Services []string `json:"services,omitempty"`
+}
+
+type DownResponse struct {
+	Services []ServiceResult `json:"services"`
+}
+
+type StatusResponse struct {
+	Repo     string          `json:"repo"`
+	Worktree string          `json:"worktree"`
+	Services []ServiceResult `json:"services"`
+}
+
+type ListedContainer struct {
+	Type      string                  `json:"type"`
+	Container string                  `json:"container"`
+	Volume    string                  `json:"volume,omitempty"`
+	Repo      string                  `json:"repo"`
+	Worktree  string                  `json:"worktree"`
+	State     string                  `json:"state"`
+	CreatedAt string                  `json:"created_at"`
+	Endpoints map[string]EndpointInfo `json:"endpoints,omitempty"`
+}
+
+// ---------- multi-service operations ----------
+
+func (s *Server) resolveServices(requested []string) ([]ServiceDef, error) {
+	if len(requested) == 0 {
+		requested = s.cfg.DefaultServices
+	}
+	if len(requested) == 0 {
+		return nil, errors.New("no services requested and no server default configured")
+	}
+	out := make([]ServiceDef, 0, len(requested))
+	for _, name := range requested {
+		def, ok := serviceDefs[name]
+		if !ok {
+			return nil, fmt.Errorf("unknown service %q", name)
+		}
+		out = append(out, def)
+	}
+	return out, nil
+}
+
+func (s *Server) opUp(ctx context.Context, req UpRequest) (*UpResponse, error) {
+	defs, err := s.resolveServices(req.Services)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]ServiceResult, 0, len(defs))
+	for _, def := range defs {
+		image := ""
+		if def.Type == "postgres" {
+			image = req.Image
+		}
+		res, err := s.serviceUp(ctx, def, req.Repo, req.Worktree, image)
+		if err != nil {
+			return &UpResponse{Services: results}, err
+		}
+		results = append(results, res)
+	}
+	return &UpResponse{Services: results}, nil
+}
+
+func (s *Server) opDown(ctx context.Context, req DownRequest) (*DownResponse, error) {
+	defs, err := s.resolveServices(req.Services)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]ServiceResult, 0, len(defs))
+	for _, def := range defs {
+		res, err := s.serviceDown(ctx, def, req.Repo, req.Worktree)
+		if err != nil {
+			return &DownResponse{Services: results}, err
+		}
+		results = append(results, res)
+	}
+	return &DownResponse{Services: results}, nil
+}
+
+func (s *Server) opStatus(ctx context.Context, repo, worktree, service string) (*StatusResponse, error) {
+	var defs []ServiceDef
+	if service != "" {
+		def, ok := serviceDefs[service]
+		if !ok {
+			return nil, fmt.Errorf("unknown service %q", service)
+		}
+		defs = []ServiceDef{def}
+	} else {
+		var err error
+		defs, err = s.resolveServices(nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	results := make([]ServiceResult, 0, len(defs))
+	for _, def := range defs {
+		res, err := s.serviceStatus(ctx, def, repo, worktree)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, res)
+	}
+	return &StatusResponse{Repo: repo, Worktree: worktree, Services: results}, nil
 }
 
 func (s *Server) listContainers(ctx context.Context) ([]ListedContainer, error) {
@@ -396,212 +684,32 @@ func (s *Server) listContainers(ctx context.Context) ([]ListedContainer, error) 
 			return nil, fmt.Errorf("parse docker ps row: %w", err)
 		}
 		labels := parseDockerLabels(row.Labels)
+		typ := labels[labelService]
+		if typ == "" {
+			typ = "postgres" // legacy fallback
+		}
+		def, defKnown := serviceDefs[typ]
 		lc := ListedContainer{
+			Type:      typ,
 			Container: row.Names,
 			Repo:      labels[labelRepo],
 			Worktree:  labels[labelWorktree],
 			State:     row.State,
 			CreatedAt: row.CreatedAt,
 		}
-		if row.State == "running" {
-			port, err := s.hostPort(ctx, row.Names, 5432)
+		if defKnown {
+			vname, _ := serviceVolumeName(def.VolumePrefix, lc.Repo, lc.Worktree)
+			lc.Volume = vname
+		}
+		if row.State == "running" && defKnown {
+			hostPorts, err := s.collectHostPorts(ctx, row.Names, def)
 			if err == nil {
-				lc.HostPort = port
-				lc.URL = s.buildURL(port)
+				lc.Endpoints = buildEndpointInfo(s.cfg, def, hostPorts)
 			}
 		}
 		results = append(results, lc)
 	}
 	return results, nil
-}
-
-func parseDockerLabels(s string) map[string]string {
-	out := map[string]string{}
-	for _, kv := range strings.Split(s, ",") {
-		kv = strings.TrimSpace(kv)
-		if kv == "" {
-			continue
-		}
-		i := strings.Index(kv, "=")
-		if i < 0 {
-			continue
-		}
-		out[kv[:i]] = kv[i+1:]
-	}
-	return out
-}
-
-func (s *Server) buildURL(port string) string {
-	pw := url.QueryEscape(s.cfg.PgPassword)
-	return fmt.Sprintf("postgresql://%s:%s@%s:%s/%s",
-		s.cfg.PgUser, pw, s.cfg.AdvertiseHost, port, s.cfg.PgDB)
-}
-
-// ---------- core operations ----------
-
-type UpRequest struct {
-	Repo     string `json:"repo"`
-	Worktree string `json:"worktree"`
-	Image    string `json:"image,omitempty"`
-}
-
-type UpResponse struct {
-	Container string `json:"container"`
-	Volume    string `json:"volume"`
-	URL       string `json:"url"`
-	HostPort  string `json:"host_port"`
-	Reused    bool   `json:"reused"`
-}
-
-func (s *Server) opUp(ctx context.Context, req UpRequest) (*UpResponse, error) {
-	cname, err := serviceContainerName("pg", req.Repo, req.Worktree)
-	if err != nil {
-		return nil, err
-	}
-	vname, err := serviceVolumeName("pgvol", req.Repo, req.Worktree)
-	if err != nil {
-		return nil, err
-	}
-	image := req.Image
-	if image == "" {
-		image = s.cfg.PgImage
-	}
-
-	state, err := s.inspect(ctx, cname)
-	if err != nil {
-		return nil, err
-	}
-
-	reused := false
-	switch {
-	case state.Exists && state.Running:
-		reused = true
-	case state.Exists && !state.Running:
-		if err := s.containerStart(ctx, cname); err != nil {
-			return nil, err
-		}
-		if err := s.pgIsReady(ctx, cname); err != nil {
-			tail := s.logsTail(ctx, cname, 50)
-			return nil, fmt.Errorf("%w\nlast 50 log lines:\n%s", err, tail)
-		}
-		reused = true
-	default:
-		if err := s.volumeCreate(ctx, vname); err != nil {
-			return nil, err
-		}
-		runErr := s.containerRun(ctx, runOpts{
-			def:       postgresDef,
-			container: cname, volume: vname, image: image,
-			repo: normalize(req.Repo), worktree: normalize(req.Worktree),
-		})
-		if runErr != nil {
-			if strings.Contains(runErr.Error(), "is already in use") {
-				// race - reinspect and retry
-				state2, err2 := s.inspect(ctx, cname)
-				if err2 != nil {
-					return nil, err2
-				}
-				if !state2.Exists {
-					return nil, runErr
-				}
-				reused = true
-			} else {
-				return nil, runErr
-			}
-		}
-		if !reused {
-			if err := s.pgIsReady(ctx, cname); err != nil {
-				tail := s.logsTail(ctx, cname, 50)
-				return nil, fmt.Errorf("%w\nlast 50 log lines:\n%s", err, tail)
-			}
-		}
-	}
-
-	port, err := s.hostPort(ctx, cname, 5432)
-	if err != nil {
-		return nil, err
-	}
-	return &UpResponse{
-		Container: cname,
-		Volume:    vname,
-		URL:       s.buildURL(port),
-		HostPort:  port,
-		Reused:    reused,
-	}, nil
-}
-
-type DownRequest struct {
-	Repo     string `json:"repo"`
-	Worktree string `json:"worktree"`
-}
-
-type DownResponse struct {
-	Container string `json:"container"`
-	Volume    string `json:"volume"`
-}
-
-func (s *Server) opDown(ctx context.Context, req DownRequest) (*DownResponse, error) {
-	cname, err := serviceContainerName("pg", req.Repo, req.Worktree)
-	if err != nil {
-		return nil, err
-	}
-	vname, err := serviceVolumeName("pgvol", req.Repo, req.Worktree)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.containerRemove(ctx, cname); err != nil {
-		return nil, err
-	}
-	if err := s.volumeRemove(ctx, vname); err != nil {
-		return nil, err
-	}
-	return &DownResponse{Container: cname, Volume: vname}, nil
-}
-
-type StatusResponse struct {
-	Repo      string `json:"repo"`
-	Worktree  string `json:"worktree"`
-	Container string `json:"container"`
-	Volume    string `json:"volume"`
-	State     string `json:"state"`
-	URL       string `json:"url,omitempty"`
-	HostPort  string `json:"host_port,omitempty"`
-	CreatedAt string `json:"created_at,omitempty"`
-}
-
-func (s *Server) opStatus(ctx context.Context, repo, worktree string) (*StatusResponse, error) {
-	cname, err := serviceContainerName("pg", repo, worktree)
-	if err != nil {
-		return nil, err
-	}
-	vname, err := serviceVolumeName("pgvol", repo, worktree)
-	if err != nil {
-		return nil, err
-	}
-	state, err := s.inspect(ctx, cname)
-	if err != nil {
-		return nil, err
-	}
-	resp := &StatusResponse{
-		Repo: repo, Worktree: worktree, Container: cname, Volume: vname,
-	}
-	if !state.Exists {
-		resp.State = "missing"
-		return resp, nil
-	}
-	resp.CreatedAt = state.CreatedAt
-	if !state.Running {
-		resp.State = "stopped"
-		return resp, nil
-	}
-	resp.State = "running"
-	port, err := s.hostPort(ctx, cname, 5432)
-	if err != nil {
-		return nil, err
-	}
-	resp.HostPort = port
-	resp.URL = s.buildURL(port)
-	return resp, nil
 }
 
 // ---------- REST handlers ----------
@@ -624,7 +732,10 @@ func (s *Server) handleUp(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := s.opUp(r.Context(), req)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":    err.Error(),
+			"services": resp.Services,
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -638,7 +749,10 @@ func (s *Server) handleDown(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := s.opDown(r.Context(), req)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":    err.Error(),
+			"services": resp.Services,
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -647,11 +761,12 @@ func (s *Server) handleDown(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get("repo")
 	worktree := r.URL.Query().Get("worktree")
+	service := r.URL.Query().Get("service")
 	if repo == "" || worktree == "" {
 		writeError(w, http.StatusBadRequest, errors.New("repo and worktree query params required"))
 		return
 	}
-	resp, err := s.opStatus(r.Context(), repo, worktree)
+	resp, err := s.opStatus(r.Context(), repo, worktree, service)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -747,20 +862,39 @@ type mcpTool struct {
 }
 
 func (s *Server) tools() []mcpTool {
-	rw := map[string]any{
+	rwSvc := map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"repo":     map[string]any{"type": "string", "description": "Repository name"},
 			"worktree": map[string]any{"type": "string", "description": "Worktree name"},
+			"services": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "Optional subset of service types to act on. Defaults to server's --services list.",
+			},
 		},
 		"required": []string{"repo", "worktree"},
 	}
-	up := map[string]any{
+	rwOptionalService := map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"repo":     map[string]any{"type": "string", "description": "Repository name"},
 			"worktree": map[string]any{"type": "string", "description": "Worktree name"},
-			"image":    map[string]any{"type": "string", "description": "Optional Postgres image override"},
+			"service":  map[string]any{"type": "string", "description": "Optional single service type to filter to."},
+		},
+		"required": []string{"repo", "worktree"},
+	}
+	upSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"repo":     map[string]any{"type": "string", "description": "Repository name"},
+			"worktree": map[string]any{"type": "string", "description": "Worktree name"},
+			"services": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "Optional subset of service types to bring up. Defaults to server's --services list.",
+			},
+			"image": map[string]any{"type": "string", "description": "Optional postgres image override."},
 		},
 		"required": []string{"repo", "worktree"},
 	}
@@ -769,9 +903,9 @@ func (s *Server) tools() []mcpTool {
 		"properties": map[string]any{},
 	}
 	return []mcpTool{
-		{Name: "pgpool_up", Description: "Create or reuse a Postgres container for a worktree. Returns connection URL.", InputSchema: up},
-		{Name: "pgpool_down", Description: "Destroy the Postgres container and its volume for a worktree.", InputSchema: rw},
-		{Name: "pgpool_status", Description: "Report container state for a worktree.", InputSchema: rw},
+		{Name: "pgpool_up", Description: "Bring up the configured services for a worktree. Returns one entry per service with its endpoints.", InputSchema: upSchema},
+		{Name: "pgpool_down", Description: "Tear down services for a worktree. Defaults to all configured services.", InputSchema: rwSvc},
+		{Name: "pgpool_status", Description: "Report state of services for a worktree. Optionally filter to one service.", InputSchema: rwOptionalService},
 		{Name: "pgpool_list", Description: "List all pgpool-managed containers on this host.", InputSchema: empty},
 	}
 }
@@ -868,13 +1002,14 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 		var req struct {
 			Repo     string `json:"repo"`
 			Worktree string `json:"worktree"`
+			Service  string `json:"service"`
 		}
 		if len(args) > 0 {
 			if err := json.Unmarshal(args, &req); err != nil {
 				return nil, fmt.Errorf("parse arguments: %w", err)
 			}
 		}
-		return s.opStatus(ctx, req.Repo, req.Worktree)
+		return s.opStatus(ctx, req.Repo, req.Worktree, req.Service)
 	case "pgpool_list":
 		items, err := s.listContainers(ctx)
 		if err != nil {
@@ -889,6 +1024,19 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 	}
 }
 
+// ---------- helpers ----------
+
+func parseServicesCSV(s string) []string {
+	out := []string{}
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // ---------- main ----------
 
 func getenv(key, fallback string) string {
@@ -899,6 +1047,8 @@ func getenv(key, fallback string) string {
 }
 
 func main() {
+	servicesCSV := getenv("PGPOOL_SERVICES", "postgres")
+
 	cfg := Config{
 		ListenAddr:     getenv("PGPOOL_LISTEN", ":8080"),
 		AdvertiseHost:  getenv("PGPOOL_ADVERTISE_HOST", "localhost"),
@@ -918,6 +1068,7 @@ func main() {
 	flag.StringVar(&cfg.PgDB, "pg-db", cfg.PgDB, "default database name")
 	flag.StringVar(&cfg.DockerBin, "docker-bin", cfg.DockerBin, "docker binary path")
 	flag.DurationVar(&cfg.StartupTimeout, "startup-timeout", cfg.StartupTimeout, "postgres readiness timeout")
+	flag.StringVar(&servicesCSV, "services", servicesCSV, "comma-separated list of service types to bring up by default")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -928,6 +1079,16 @@ func main() {
 
 	if cfg.PgPassword == "" {
 		log.Fatal("pgpool: --pg-password (or PGPOOL_PG_PASSWORD) is required")
+	}
+
+	cfg.DefaultServices = parseServicesCSV(servicesCSV)
+	if len(cfg.DefaultServices) == 0 {
+		log.Fatal("pgpool: --services must be non-empty")
+	}
+	for _, name := range cfg.DefaultServices {
+		if _, ok := serviceDefs[name]; !ok {
+			log.Fatalf("pgpool: unknown service %q in --services", name)
+		}
 	}
 
 	srv := &Server{cfg: cfg}
@@ -957,7 +1118,8 @@ func main() {
 		_ = httpSrv.Shutdown(shutCtx)
 	}()
 
-	log.Printf("pgpool listening on %s (advertise-host=%s, image=%s)", cfg.ListenAddr, cfg.AdvertiseHost, cfg.PgImage)
+	log.Printf("pgpool listening on %s (advertise-host=%s, services=%s, postgres-image=%s)",
+		cfg.ListenAddr, cfg.AdvertiseHost, strings.Join(cfg.DefaultServices, ","), cfg.PgImage)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("pgpool: %v", err)
 	}
