@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -279,6 +280,75 @@ func (c *client) do(method, path string, body any, out any) error {
 	return nil
 }
 
+// ---------- response types ----------
+
+type endpointJSON struct {
+	URL           string `json:"url"`
+	HostPort      string `json:"host_port"`
+	ContainerPort int    `json:"container_port"`
+}
+
+type serviceResultJSON struct {
+	Type      string                  `json:"type"`
+	Container string                  `json:"container"`
+	Volume    string                  `json:"volume"`
+	State     string                  `json:"state,omitempty"`
+	Reused    bool                    `json:"reused,omitempty"`
+	CreatedAt string                  `json:"created_at,omitempty"`
+	Endpoints map[string]endpointJSON `json:"endpoints,omitempty"`
+}
+
+type listedJSON struct {
+	Type      string                  `json:"type"`
+	Container string                  `json:"container"`
+	Volume    string                  `json:"volume"`
+	Repo      string                  `json:"repo"`
+	Worktree  string                  `json:"worktree"`
+	State     string                  `json:"state"`
+	CreatedAt string                  `json:"created_at"`
+	Endpoints map[string]endpointJSON `json:"endpoints,omitempty"`
+}
+
+func printServiceBlock(svc serviceResultJSON, includeReused bool) {
+	fmt.Printf("\n=== %s ===\n", svc.Type)
+	fmt.Printf("container: %s\n", svc.Container)
+	fmt.Printf("volume:    %s\n", svc.Volume)
+	if svc.State != "" {
+		fmt.Printf("state:     %s\n", svc.State)
+	}
+	if includeReused {
+		fmt.Printf("reused:    %v\n", svc.Reused)
+	}
+	for _, role := range sortedRoles(svc.Endpoints) {
+		ep := svc.Endpoints[role]
+		fmt.Printf("%-9s  %s\n", role+".url:", ep.URL)
+	}
+}
+
+func sortedRoles(m map[string]endpointJSON) []string {
+	roles := make([]string, 0, len(m))
+	for r := range m {
+		roles = append(roles, r)
+	}
+	sort.Strings(roles)
+	return roles
+}
+
+func endpointsSummary(m map[string]endpointJSON, maxLen int) string {
+	if len(m) == 0 {
+		return "-"
+	}
+	parts := make([]string, 0, len(m))
+	for _, role := range sortedRoles(m) {
+		parts = append(parts, role+"="+m[role].HostPort)
+	}
+	out := strings.Join(parts, " ")
+	if len(out) > maxLen {
+		return out[:maxLen-3] + "..."
+	}
+	return out
+}
+
 // ---------- command implementations ----------
 
 type runCtx struct {
@@ -288,70 +358,75 @@ type runCtx struct {
 	cfgPath  string
 }
 
-func cmdUp(rc *runCtx, repo, worktree, image string) error {
-	body := map[string]string{"repo": repo, "worktree": worktree}
-	if image != "" {
-		body["image"] = image
+func cmdUp(rc *runCtx, repo, worktree string, services []string) error {
+	body := map[string]any{"repo": repo, "worktree": worktree}
+	if len(services) > 0 {
+		body["services"] = services
 	}
-	var resp map[string]any
+	var resp struct {
+		Services []serviceResultJSON `json:"services"`
+	}
 	if err := rc.client.do(http.MethodPost, "/v1/up", body, &resp); err != nil {
 		return err
 	}
 	if rc.jsonOnly {
 		return printJSON(resp)
 	}
-	fmt.Printf("container: %s\n", stringOr(resp["container"], "-"))
-	fmt.Printf("volume:    %s\n", stringOr(resp["volume"], "-"))
-	fmt.Printf("host_port: %s\n", stringOr(resp["host_port"], "-"))
-	fmt.Printf("reused:    %v\n", resp["reused"])
-	fmt.Printf("url:       %s\n", stringOr(resp["url"], "-"))
+	for _, svc := range resp.Services {
+		printServiceBlock(svc, true)
+	}
 	return nil
 }
 
-func cmdDown(rc *runCtx, repo, worktree string) error {
-	body := map[string]string{"repo": repo, "worktree": worktree}
-	var resp map[string]any
+func cmdDown(rc *runCtx, repo, worktree string, services []string) error {
+	body := map[string]any{"repo": repo, "worktree": worktree}
+	if len(services) > 0 {
+		body["services"] = services
+	}
+	var resp struct {
+		Services []serviceResultJSON `json:"services"`
+	}
 	if err := rc.client.do(http.MethodPost, "/v1/down", body, &resp); err != nil {
 		return err
 	}
 	if rc.jsonOnly {
 		return printJSON(resp)
 	}
-	fmt.Printf("removed container: %s\n", stringOr(resp["container"], "-"))
-	fmt.Printf("removed volume:    %s\n", stringOr(resp["volume"], "-"))
+	for _, svc := range resp.Services {
+		fmt.Printf("removed %s container: %s\n", svc.Type, svc.Container)
+		fmt.Printf("removed %s volume:    %s\n", svc.Type, svc.Volume)
+	}
 	return nil
 }
 
-func cmdStatus(rc *runCtx, repo, worktree string) error {
+func cmdStatus(rc *runCtx, repo, worktree, service string) error {
 	q := url.Values{}
 	q.Set("repo", repo)
 	q.Set("worktree", worktree)
-	var resp map[string]any
+	if service != "" {
+		q.Set("service", service)
+	}
+	var resp struct {
+		Repo     string              `json:"repo"`
+		Worktree string              `json:"worktree"`
+		Services []serviceResultJSON `json:"services"`
+	}
 	if err := rc.client.do(http.MethodGet, "/v1/status?"+q.Encode(), nil, &resp); err != nil {
 		return err
 	}
 	if rc.jsonOnly {
 		return printJSON(resp)
 	}
-	fmt.Printf("repo:      %s\n", stringOr(resp["repo"], "-"))
-	fmt.Printf("worktree:  %s\n", stringOr(resp["worktree"], "-"))
-	fmt.Printf("container: %s\n", stringOr(resp["container"], "-"))
-	fmt.Printf("volume:    %s\n", stringOr(resp["volume"], "-"))
-	fmt.Printf("state:     %s\n", stringOr(resp["state"], "-"))
-	if s := stringOr(resp["host_port"], ""); s != "" {
-		fmt.Printf("host_port: %s\n", s)
-	}
-	if s := stringOr(resp["url"], ""); s != "" {
-		fmt.Printf("url:       %s\n", s)
-	}
-	if s := stringOr(resp["created_at"], ""); s != "" {
-		fmt.Printf("created:   %s\n", s)
+	fmt.Printf("repo:     %s\n", resp.Repo)
+	fmt.Printf("worktree: %s\n", resp.Worktree)
+	for _, svc := range resp.Services {
+		printServiceBlock(svc, false)
 	}
 	return nil
 }
 
 func cmdList(rc *runCtx) error {
-	var resp []map[string]any
+	var resp []listedJSON
 	if err := rc.client.do(http.MethodGet, "/v1/list", nil, &resp); err != nil {
 		return err
 	}
@@ -362,13 +437,14 @@ func cmdList(rc *runCtx) error {
 		fmt.Println("(no pgpool-managed containers)")
 		return nil
 	}
-	fmt.Printf("%-40s  %-10s  %-6s  %s\n", "CONTAINER", "STATE", "PORT", "URL")
+	fmt.Printf("%-12s  %-32s  %-12s  %-10s  %s\n", "TYPE", "CONTAINER", "WORKTREE", "STATE", "ENDPOINTS")
 	for _, row := range resp {
-		fmt.Printf("%-40s  %-10s  %-6s  %s\n",
-			truncate(stringOr(row["container"], "-"), 40),
-			stringOr(row["state"], "-"),
-			stringOr(row["host_port"], "-"),
-			stringOr(row["url"], "-"),
+		fmt.Printf("%-12s  %-32s  %-12s  %-10s  %s\n",
+			row.Type,
+			truncate(row.Container, 32),
+			truncate(row.Worktree, 12),
+			row.State,
+			endpointsSummary(row.Endpoints, 60),
 		)
 	}
 	return nil
@@ -654,7 +730,6 @@ func runUp(args []string) {
 	addGlobalFlags(fs, &g)
 	repo := fs.String("repo", "", "repository name (defaults to git-detected)")
 	worktree := fs.String("worktree", "", "worktree name (defaults to $PWD basename)")
-	image := fs.String("image", "", "override postgres image for this run")
 	must(fs.Parse(args))
 
 	if *repo == "" {
@@ -670,7 +745,7 @@ func runUp(args []string) {
 
 	rc, err := newRunCtx(g)
 	fail(err)
-	fail(cmdUp(rc, r, w, *image))
+	fail(cmdUp(rc, r, w, fs.Args()))
 }
 
 func runDown(args []string) {
@@ -694,7 +769,7 @@ func runDown(args []string) {
 
 	rc, err := newRunCtx(g)
 	fail(err)
-	fail(cmdDown(rc, r, w))
+	fail(cmdDown(rc, r, w, fs.Args()))
 }
 
 func runStatus(args []string) {
@@ -718,7 +793,12 @@ func runStatus(args []string) {
 
 	rc, err := newRunCtx(g)
 	fail(err)
-	fail(cmdStatus(rc, r, w))
+
+	var service string
+	if rest := fs.Args(); len(rest) > 0 {
+		service = rest[0]
+	}
+	fail(cmdStatus(rc, r, w, service))
 }
 
 func runList(args []string) {
