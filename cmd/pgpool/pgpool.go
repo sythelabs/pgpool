@@ -742,22 +742,23 @@ func (s *Server) listContainers(ctx context.Context) ([]ListedContainer, error) 
 		labels := parseDockerLabels(row.Labels)
 		typ := labels[labelService]
 		if typ == "" {
-			typ = "postgres" // legacy fallback
+			continue
 		}
 		def, defKnown := serviceDefs[typ]
+		if !defKnown {
+			continue
+		}
+		vname, _ := serviceVolumeName(def.VolumePrefix, labels[labelRepo], labels[labelWorktree])
 		lc := ListedContainer{
 			Type:      typ,
 			Container: row.Names,
+			Volume:    vname,
 			Repo:      labels[labelRepo],
 			Worktree:  labels[labelWorktree],
 			State:     row.State,
 			CreatedAt: row.CreatedAt,
 		}
-		if defKnown {
-			vname, _ := serviceVolumeName(def.VolumePrefix, lc.Repo, lc.Worktree)
-			lc.Volume = vname
-		}
-		if row.State == "running" && defKnown {
+		if row.State == "running" {
 			hostPorts, err := s.collectHostPorts(ctx, row.Names, def)
 			if err == nil {
 				lc.Endpoints = buildEndpointInfo(s.cfg, def, hostPorts)

@@ -35,7 +35,7 @@ Both are served from the same process on the same port. Choose whichever is conv
 - `POST /v1/up` - body `{"repo","worktree","services":["postgres","seaweedfs"]?, "image"?}` -> `{"services":[{type,container,volume,reused,endpoints:{role:{url,host_port,container_port}}}]}`. `services` defaults to the server's configured set; `image` (when present) applies to the postgres entry.
 - `POST /v1/down` - body `{"repo","worktree","services"?}` -> `{"services":[{type,container,volume}]}`. Defaults to the configured set.
 - `GET /v1/status?repo=X&worktree=Y[&service=Z]` -> `{repo,worktree,services:[...]}`. Optional `service` filter narrows to one entry.
-- `GET /v1/list` -> array of `{type,container,volume,repo,worktree,state,created_at,endpoints?}`. One row per pgpool-labelled container. Containers without a `pgpool.service` label are reported as `type: "postgres"` (legacy fallback).
+- `GET /v1/list` -> array of `{type,container,volume,repo,worktree,state,created_at,endpoints?}`. One row per pgpool-labelled container with a known `pgpool.service` value. Containers missing the label or labelled with an unknown service are excluded.
 - `GET /healthz` - liveness.
 
 ### MCP
