@@ -80,33 +80,33 @@ func truncateWithHash(s string, max int) string {
 	return strings.TrimRight(s[:keep], "-") + "-" + short
 }
 
-func containerName(repo, worktree string) (string, error) {
+func serviceContainerName(prefix, repo, worktree string) (string, error) {
 	r := normalize(repo)
 	w := normalize(worktree)
 	if r == "" || w == "" {
 		return "", errors.New("repo and worktree must not be empty after normalization")
 	}
-	name := "pg-" + r + "-" + w
+	name := prefix + "-" + r + "-" + w
 	if len(name) > dockerNameMax {
-		budget := dockerNameMax - len("pg-"+r+"-")
+		budget := dockerNameMax - len(prefix+"-"+r+"-")
 		w = truncateWithHash(w, budget)
-		name = "pg-" + r + "-" + w
+		name = prefix + "-" + r + "-" + w
 		log.Printf("pgpool: container name exceeded %d chars, truncated worktree to %q", dockerNameMax, w)
 	}
 	return name, nil
 }
 
-func volumeName(repo, worktree string) (string, error) {
+func serviceVolumeName(prefix, repo, worktree string) (string, error) {
 	r := normalize(repo)
 	w := normalize(worktree)
 	if r == "" || w == "" {
 		return "", errors.New("repo and worktree must not be empty after normalization")
 	}
-	name := "pgvol-" + r + "-" + w
+	name := prefix + "-" + r + "-" + w
 	if len(name) > dockerNameMax {
-		budget := dockerNameMax - len("pgvol-"+r+"-")
+		budget := dockerNameMax - len(prefix+"-"+r+"-")
 		w = truncateWithHash(w, budget)
-		name = "pgvol-" + r + "-" + w
+		name = prefix + "-" + r + "-" + w
 	}
 	return name, nil
 }
@@ -372,11 +372,11 @@ type UpResponse struct {
 }
 
 func (s *Server) opUp(ctx context.Context, req UpRequest) (*UpResponse, error) {
-	cname, err := containerName(req.Repo, req.Worktree)
+	cname, err := serviceContainerName("pg", req.Repo, req.Worktree)
 	if err != nil {
 		return nil, err
 	}
-	vname, err := volumeName(req.Repo, req.Worktree)
+	vname, err := serviceVolumeName("pgvol", req.Repo, req.Worktree)
 	if err != nil {
 		return nil, err
 	}
@@ -458,11 +458,11 @@ type DownResponse struct {
 }
 
 func (s *Server) opDown(ctx context.Context, req DownRequest) (*DownResponse, error) {
-	cname, err := containerName(req.Repo, req.Worktree)
+	cname, err := serviceContainerName("pg", req.Repo, req.Worktree)
 	if err != nil {
 		return nil, err
 	}
-	vname, err := volumeName(req.Repo, req.Worktree)
+	vname, err := serviceVolumeName("pgvol", req.Repo, req.Worktree)
 	if err != nil {
 		return nil, err
 	}
@@ -487,11 +487,11 @@ type StatusResponse struct {
 }
 
 func (s *Server) opStatus(ctx context.Context, repo, worktree string) (*StatusResponse, error) {
-	cname, err := containerName(repo, worktree)
+	cname, err := serviceContainerName("pg", repo, worktree)
 	if err != nil {
 		return nil, err
 	}
-	vname, err := volumeName(repo, worktree)
+	vname, err := serviceVolumeName("pgvol", repo, worktree)
 	if err != nil {
 		return nil, err
 	}
