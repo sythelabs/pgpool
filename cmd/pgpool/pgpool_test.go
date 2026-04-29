@@ -77,6 +77,31 @@ func TestServiceVolumeName(t *testing.T) {
 	}
 }
 
+func TestBuildEndpointInfo(t *testing.T) {
+	cfg := Config{
+		AdvertiseHost: "host.example",
+		PgUser:        "u",
+		PgPassword:    "p p",
+		PgDB:          "d",
+	}
+	hostPorts := map[string]string{"primary": "49160"}
+	endpoints := buildEndpointInfo(cfg, postgresDef, hostPorts)
+	got, ok := endpoints["primary"]
+	if !ok {
+		t.Fatal("missing primary endpoint")
+	}
+	wantURL := "postgresql://u:p%20p@host.example:49160/d"
+	if got.URL != wantURL {
+		t.Errorf("URL = %q, want %q", got.URL, wantURL)
+	}
+	if got.HostPort != "49160" {
+		t.Errorf("HostPort = %q", got.HostPort)
+	}
+	if got.ContainerPort != 5432 {
+		t.Errorf("ContainerPort = %d, want 5432", got.ContainerPort)
+	}
+}
+
 func TestServiceRegistry_Validity(t *testing.T) {
 	if len(serviceDefs) == 0 {
 		t.Fatal("serviceDefs is empty")

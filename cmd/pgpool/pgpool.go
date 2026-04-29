@@ -77,14 +77,42 @@ var postgresDef = ServiceDef{
 		return s.pgIsReady(ctx, container)
 	},
 	BuildURL: func(cfg Config, role, hostPort string) string {
-		pw := url.QueryEscape(cfg.PgPassword)
-		return fmt.Sprintf("postgresql://%s:%s@%s:%s/%s",
-			cfg.PgUser, pw, cfg.AdvertiseHost, hostPort, cfg.PgDB)
+		u := &url.URL{
+			Scheme: "postgresql",
+			User:   url.UserPassword(cfg.PgUser, cfg.PgPassword),
+			Host:   cfg.AdvertiseHost + ":" + hostPort,
+			Path:   cfg.PgDB,
+		}
+		return u.String()
 	},
 }
 
 func init() {
 	serviceDefs[postgresDef.Type] = postgresDef
+}
+
+// ---------- endpoint helpers ----------
+
+type EndpointInfo struct {
+	URL           string `json:"url"`
+	HostPort      string `json:"host_port"`
+	ContainerPort int    `json:"container_port"`
+}
+
+func buildEndpointInfo(cfg Config, def ServiceDef, hostPorts map[string]string) map[string]EndpointInfo {
+	out := map[string]EndpointInfo{}
+	for _, e := range def.Endpoints {
+		hp, ok := hostPorts[e.Role]
+		if !ok {
+			continue
+		}
+		out[e.Role] = EndpointInfo{
+			URL:           def.BuildURL(cfg, e.Role, hp),
+			HostPort:      hp,
+			ContainerPort: e.ContainerPort,
+		}
+	}
+	return out
 }
 
 // serverVersion is set at link time via -ldflags "-X main.serverVersion=..."
