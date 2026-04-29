@@ -218,12 +218,11 @@ func (s *Server) inspect(ctx context.Context, name string) (InspectState, error)
 	}, nil
 }
 
-func (s *Server) hostPort(ctx context.Context, name string) (string, error) {
-	out, errOut, err := s.runDocker(ctx, "port", name, "5432/tcp")
+func (s *Server) hostPort(ctx context.Context, name string, containerPort int) (string, error) {
+	out, errOut, err := s.runDocker(ctx, "port", name, fmt.Sprintf("%d/tcp", containerPort))
 	if err != nil {
-		return "", fmt.Errorf("docker port %s: %w: %s", name, err, strings.TrimSpace(errOut))
+		return "", fmt.Errorf("docker port %s %d/tcp: %w: %s", name, containerPort, err, strings.TrimSpace(errOut))
 	}
-	// Output looks like: "0.0.0.0:49734\n[::]:49734\n"
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		idx := strings.LastIndex(line, ":")
 		if idx < 0 {
@@ -234,7 +233,7 @@ func (s *Server) hostPort(ctx context.Context, name string) (string, error) {
 			return port, nil
 		}
 	}
-	return "", fmt.Errorf("docker port %s: no mapping found in %q", name, out)
+	return "", fmt.Errorf("docker port %s %d/tcp: no mapping found in %q", name, containerPort, out)
 }
 
 func (s *Server) logsTail(ctx context.Context, name string, n int) string {
@@ -374,7 +373,7 @@ func (s *Server) listContainers(ctx context.Context) ([]ListedContainer, error) 
 			CreatedAt: row.CreatedAt,
 		}
 		if row.State == "running" {
-			port, err := s.hostPort(ctx, row.Names)
+			port, err := s.hostPort(ctx, row.Names, 5432)
 			if err == nil {
 				lc.HostPort = port
 				lc.URL = s.buildURL(port)
@@ -486,7 +485,7 @@ func (s *Server) opUp(ctx context.Context, req UpRequest) (*UpResponse, error) {
 		}
 	}
 
-	port, err := s.hostPort(ctx, cname)
+	port, err := s.hostPort(ctx, cname, 5432)
 	if err != nil {
 		return nil, err
 	}
@@ -564,7 +563,7 @@ func (s *Server) opStatus(ctx context.Context, repo, worktree string) (*StatusRe
 		return resp, nil
 	}
 	resp.State = "running"
-	port, err := s.hostPort(ctx, cname)
+	port, err := s.hostPort(ctx, cname, 5432)
 	if err != nil {
 		return nil, err
 	}
