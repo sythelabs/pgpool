@@ -76,3 +76,51 @@ func TestServiceVolumeName(t *testing.T) {
 		t.Errorf("got %q, want pgvol-foo-bar", got)
 	}
 }
+
+func TestServiceRegistry_Validity(t *testing.T) {
+	if len(serviceDefs) == 0 {
+		t.Fatal("serviceDefs is empty")
+	}
+	for typ, def := range serviceDefs {
+		if def.Type != typ {
+			t.Errorf("serviceDefs[%q].Type = %q", typ, def.Type)
+		}
+		if def.ContainerPrefix == "" {
+			t.Errorf("%s: ContainerPrefix is empty", typ)
+		}
+		if def.VolumePrefix == "" {
+			t.Errorf("%s: VolumePrefix is empty", typ)
+		}
+		if def.Image == "" {
+			t.Errorf("%s: Image is empty", typ)
+		}
+		if len(def.Endpoints) == 0 {
+			t.Errorf("%s: Endpoints is empty", typ)
+		}
+		if def.Readiness == nil {
+			t.Errorf("%s: Readiness is nil", typ)
+		}
+		if def.BuildURL == nil {
+			t.Errorf("%s: BuildURL is nil", typ)
+		}
+		if def.DockerArgs == nil {
+			t.Errorf("%s: DockerArgs is nil", typ)
+		}
+		seenRoles := map[string]bool{}
+		for _, e := range def.Endpoints {
+			if e.Role == "" {
+				t.Errorf("%s: endpoint role is empty", typ)
+			}
+			if seenRoles[e.Role] {
+				t.Errorf("%s: duplicate endpoint role %q", typ, e.Role)
+			}
+			seenRoles[e.Role] = true
+			if e.ContainerPort <= 0 || e.ContainerPort > 65535 {
+				t.Errorf("%s: endpoint %q invalid port %d", typ, e.Role, e.ContainerPort)
+			}
+			if e.Scheme == "" {
+				t.Errorf("%s: endpoint %q has empty Scheme", typ, e.Role)
+			}
+		}
+	}
+}

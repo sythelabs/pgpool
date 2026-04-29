@@ -31,9 +31,31 @@ const (
 	labelPgpool   = "pgpool"
 	labelRepo     = "pgpool.repo"
 	labelWorktree = "pgpool.worktree"
+	labelService  = "pgpool.service"
 
 	dockerNameMax = 63
 )
+
+// ---------- service registry ----------
+
+type EndpointSpec struct {
+	Role          string // "primary" | "master" | "filer" | "s3" | ...
+	ContainerPort int
+	Scheme        string // "postgresql" | "http" | ...
+}
+
+type ServiceDef struct {
+	Type            string
+	ContainerPrefix string
+	VolumePrefix    string
+	Image           string
+	DockerArgs      func(cfg Config, volume string) []string
+	Endpoints       []EndpointSpec
+	Readiness       func(ctx context.Context, s *Server, container string, hostPorts map[string]string) error
+	BuildURL        func(cfg Config, role string, hostPort string) string
+}
+
+var serviceDefs = map[string]ServiceDef{}
 
 // serverVersion is set at link time via -ldflags "-X main.serverVersion=..."
 var serverVersion = "dev"
