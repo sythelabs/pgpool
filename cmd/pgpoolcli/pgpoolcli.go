@@ -26,9 +26,11 @@ import (
 )
 
 const (
-	defaultURL        = "http://localhost:8080"
-	defaultConfigRel  = ".config/pgpool/pgpool.json"
-	claudeBeginMarker = "<!-- BEGIN PGPOOL INTEGRATION v:3 -->"
+	defaultURL = "http://localhost:8080"
+	defaultConfigRel = ".config/pgpool/pgpool.json"
+	// claudeBeginPrefix matches any version of the begin marker so init can
+	// replace older blocks (e.g. v:1, v:2) instead of stacking new ones beside them.
+	claudeBeginPrefix = "<!-- BEGIN PGPOOL INTEGRATION"
 	claudeEndMarker   = "<!-- END PGPOOL INTEGRATION -->"
 	httpTimeout       = 60 * time.Second
 )
@@ -632,40 +634,84 @@ func cmdInit(rc *runCtx, flagURL string, force, yes bool, in io.Reader, out io.W
 
 	// CLAUDE.md in current dir.
 	claudePath := "CLAUDE.md"
-	existed := true
 	existing, err := os.ReadFile(claudePath)
 	if errors.Is(err, os.ErrNotExist) {
-		existed = false
 		existing = nil
 	} else if err != nil {
 		return fmt.Errorf("read CLAUDE.md: %w", err)
 	}
 
-	if bytes.Contains(existing, []byte(claudeBeginMarker)) {
-		fmt.Fprintf(out, "CLAUDE.md already contains pgpool integration block - not modified\n")
+	next, action, err := mergeClaudeBlock(existing)
+	if err != nil {
+		return err
+	}
+	if action == claudeUnchanged {
+		fmt.Fprintf(out, "CLAUDE.md already contains the current pgpool integration block - not modified\n")
 		return nil
 	}
-
-	var next bytes.Buffer
-	next.Write(existing)
-	if existed && len(existing) > 0 && !bytes.HasSuffix(existing, []byte("\n")) {
-		next.WriteByte('\n')
-	}
-	if existed && len(existing) > 0 {
-		next.WriteByte('\n')
-	}
-	next.WriteString(claudeSegment)
-	next.WriteByte('\n')
-
-	if err := os.WriteFile(claudePath, next.Bytes(), 0o644); err != nil {
+	if err := os.WriteFile(claudePath, next, 0o644); err != nil {
 		return fmt.Errorf("write CLAUDE.md: %w", err)
 	}
-	if existed {
+	switch action {
+	case claudeReplaced:
+		fmt.Fprintf(out, "replaced existing pgpool integration block in %s\n", claudePath)
+	case claudeAppended:
 		fmt.Fprintf(out, "appended pgpool integration block to %s\n", claudePath)
-	} else {
+	case claudeCreated:
 		fmt.Fprintf(out, "created %s with pgpool integration block\n", claudePath)
 	}
 	return nil
+}
+
+type claudeMergeAction int
+
+const (
+	claudeUnchanged claudeMergeAction = iota
+	claudeReplaced
+	claudeAppended
+	claudeCreated
+)
+
+// mergeClaudeBlock returns the rewritten CLAUDE.md content plus what changed.
+// Any existing PGPOOL INTEGRATION block (any version marker) is replaced; if
+// none is present the segment is appended. The end marker must follow the
+// begin marker - a stray begin without a matching end is an error.
+func mergeClaudeBlock(existing []byte) ([]byte, claudeMergeAction, error) {
+	if len(existing) == 0 {
+		var b bytes.Buffer
+		b.WriteString(claudeSegment)
+		b.WriteByte('\n')
+		return b.Bytes(), claudeCreated, nil
+	}
+
+	beginIdx := bytes.Index(existing, []byte(claudeBeginPrefix))
+	if beginIdx < 0 {
+		var b bytes.Buffer
+		b.Write(existing)
+		if !bytes.HasSuffix(existing, []byte("\n")) {
+			b.WriteByte('\n')
+		}
+		b.WriteByte('\n')
+		b.WriteString(claudeSegment)
+		b.WriteByte('\n')
+		return b.Bytes(), claudeAppended, nil
+	}
+
+	endRel := bytes.Index(existing[beginIdx:], []byte(claudeEndMarker))
+	if endRel < 0 {
+		return nil, claudeUnchanged, fmt.Errorf("CLAUDE.md has %q without matching %q", claudeBeginPrefix, claudeEndMarker)
+	}
+	endIdx := beginIdx + endRel + len(claudeEndMarker)
+
+	if string(existing[beginIdx:endIdx]) == claudeSegment {
+		return existing, claudeUnchanged, nil
+	}
+
+	var b bytes.Buffer
+	b.Write(existing[:beginIdx])
+	b.WriteString(claudeSegment)
+	b.Write(existing[endIdx:])
+	return b.Bytes(), claudeReplaced, nil
 }
 
 // ---------- interactive helpers ----------
