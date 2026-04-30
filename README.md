@@ -1,10 +1,10 @@
 # pgpool
 
-Single-binary server that manages ephemeral PostgreSQL containers on its host,
-plus a thin CLI (`pgpoolcli`) for clients. Clients speak HTTP (REST or MCP
-JSON-RPC); the server shells out to `docker`. This system is designed for
-multi-agent workflows where you have lots of agents thrashing on features.
-It gets really annoying when they all try to spin up docker.
+Single-binary server that manages ephemeral per-worktree services (Postgres
+and SeaweedFS today, more services pluggable via a Go service registry), plus
+a thin CLI (`pgpoolcli`) for clients. Clients speak HTTP (REST or MCP JSON-RPC);
+the server shells out to `docker`. Designed for multi-agent workflows where
+many agents thrash on features and need isolated, ephemeral infra per worktree.
 
 See `CLAUDE.md` for the full server spec. What follows is how to use it.
 
@@ -46,7 +46,7 @@ Both binaries are `stdlib`-only. No third-party deps.
 ## Run the server
 
 ```
-./pgpool --pg-password hunter2 --advertise-host pgpool.tailnet.ts.net
+./pgpool --pg-password hunter2 --services postgres,seaweedfs --advertise-host pgpool.tailnet.ts.net
 ```
 
 `--advertise-host` is the hostname written into connection URLs returned to
@@ -82,13 +82,16 @@ pgpoolcli init --force                                   # overwrite an existing
 Inside a git worktree:
 
 ```
-pgpoolcli up          # create or reuse a Postgres container for this worktree
-pgpoolcli status      # show state and connection URL
-pgpoolcli list        # every pgpool-managed container on the server
-pgpoolcli down        # destroy this worktree's container and volume
+pgpoolcli up                # bring up all configured services
+pgpoolcli up postgres       # bring up just postgres
+pgpoolcli status            # show all services for this worktree
+pgpoolcli status seaweedfs  # filter to one service
+pgpoolcli list              # every pgpool-managed container on the server
+pgpoolcli down              # tear everything down for this worktree
+pgpoolcli down postgres     # tear down only postgres
 ```
 
-`up` is idempotent. `down` destroys the volume - data is gone.
+`up` is per-service idempotent. `down` destroys volumes - data is gone.
 
 `repo` and `worktree` auto-detect:
 
@@ -99,7 +102,6 @@ Override with flags on any command:
 
 ```
 pgpoolcli up --repo myrepo --worktree feature-x
-pgpoolcli up --image postgres:16        # override the Postgres image
 ```
 
 ### Config resolution (highest priority wins)
@@ -137,24 +139,27 @@ Running `pgpoolcli init` in a project appends the block below to `CLAUDE.md`
 make re-running `init` idempotent - it will not duplicate.
 
 ```markdown
-<!-- BEGIN PGPOOL INTEGRATION v:1 -->
-## Postgres Pool (pgpool)
-This project uses **pgpoolcli** to manage ephemeral Postgres containers per worktree.
-Run `pgpoolcli prime` to see full workflow context and commands.
-### Quick Reference
-` ``bash
-pgpoolcli up                # Create or reuse a Postgres container for this worktree
-pgpoolcli status            # Show current state and connection URL
-pgpoolcli list              # List all pgpool-managed containers
-pgpoolcli down              # Destroy the container and its volume
-` ``
+<!-- BEGIN PGPOOL INTEGRATION v:2 -->
+## Per-worktree services (pgpool)
+This project uses **pgpoolcli** to manage ephemeral per-worktree services (Postgres and SeaweedFS supported today).
+Run `pgpoolcli prime` for full workflow context.
+### Quick reference
+```bash
+pgpoolcli up                  # bring up all configured services
+pgpoolcli up postgres         # just postgres
+pgpoolcli status              # show all services for this worktree
+pgpoolcli status seaweedfs    # filter to one service
+pgpoolcli list                # all pgpool-managed containers on the host
+pgpoolcli down                # tear everything down for this worktree
+pgpoolcli down postgres       # tear down only postgres
+```
 Repo and worktree auto-detect from git. Override with `--repo` / `--worktree`.
 ### Rules
-- Use `pgpoolcli` to manage per-worktree databases - do NOT hand-run `docker` commands against pgpool containers
-- `pgpoolcli up` is idempotent - safe to run multiple times, does not wipe data
-- `pgpoolcli down` destroys the volume - data is NOT recoverable
-- The server does not write `.env` files - read the URL from `up`/`status` and write your own
-- One container per (repo, worktree) pair - names are derived, not chosen
+- Use `pgpoolcli` to manage per-worktree services - do NOT hand-run `docker` commands against pgpool containers.
+- `pgpoolcli up` is per-service idempotent.
+- `pgpoolcli down` destroys volumes - data is NOT recoverable.
+- The server does not write `.env` files - read endpoint URLs from `up` / `status` and write your own.
+- One container per (repo, worktree, service) tuple - names are derived, not chosen.
 <!-- END PGPOOL INTEGRATION -->
 ```
 
@@ -167,13 +172,15 @@ plain triple backticks.)
 The CLI is a thin wrapper. If you want to hit the server directly:
 
 ```
-POST /v1/up      {"repo","worktree","image?"}
-POST /v1/down    {"repo","worktree"}
-GET  /v1/status  ?repo=X&worktree=Y
+POST /v1/up      {"repo","worktree","services":[...]?,"image"?}
+POST /v1/down    {"repo","worktree","services":[...]?}
+GET  /v1/status  ?repo=X&worktree=Y[&service=Z]
 GET  /v1/list
 GET  /healthz
 POST /mcp        JSON-RPC 2.0 - tools: pgpool_up, pgpool_down, pgpool_status, pgpool_list
 ```
+
+`up` and `down` default to the server's `--services` set when `services` is omitted. Responses always have a `services` array; each entry has its own `endpoints` map keyed by role (`primary` for postgres; `master`/`volume`/`filer`/`s3` for seaweedfs).
 
 ## Security posture
 
