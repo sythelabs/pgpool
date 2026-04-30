@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -640,6 +641,25 @@ type ListedContainer struct {
 	Endpoints map[string]EndpointInfo `json:"endpoints,omitempty"`
 }
 
+type ServiceLogs struct {
+	Type      string `json:"type"`
+	Container string `json:"container"`
+	State     string `json:"state"`
+	Logs      string `json:"logs,omitempty"`
+}
+
+type LogsResponse struct {
+	Repo     string        `json:"repo"`
+	Worktree string        `json:"worktree"`
+	Tail     int           `json:"tail"`
+	Services []ServiceLogs `json:"services"`
+}
+
+const (
+	defaultLogsTail = 100
+	maxLogsTail     = 5000
+)
+
 // ---------- multi-service operations ----------
 
 func (s *Server) resolveServices(requested []string) ([]ServiceDef, error) {
@@ -720,6 +740,50 @@ func (s *Server) opStatus(ctx context.Context, repo, worktree, service string) (
 		results = append(results, res)
 	}
 	return &StatusResponse{Repo: repo, Worktree: worktree, Services: results}, nil
+}
+
+func (s *Server) opLogs(ctx context.Context, repo, worktree, service string, tail int) (*LogsResponse, error) {
+	if repo == "" || worktree == "" {
+		return nil, errors.New("repo and worktree must be non-empty")
+	}
+	var defs []ServiceDef
+	if service != "" {
+		def, ok := serviceDefs[service]
+		if !ok {
+			return nil, fmt.Errorf("unknown service %q", service)
+		}
+		defs = []ServiceDef{def}
+	} else {
+		var err error
+		defs, err = s.resolveServices(nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	results := make([]ServiceLogs, 0, len(defs))
+	for _, def := range defs {
+		cname, err := serviceContainerName(def.ContainerPrefix, repo, worktree)
+		if err != nil {
+			return nil, err
+		}
+		state, err := s.inspect(ctx, cname)
+		if err != nil {
+			return nil, err
+		}
+		entry := ServiceLogs{Type: def.Type, Container: cname}
+		switch {
+		case !state.Exists:
+			entry.State = "missing"
+		case state.Running:
+			entry.State = "running"
+			entry.Logs = s.logsTail(ctx, cname, tail)
+		default:
+			entry.State = "stopped"
+			entry.Logs = s.logsTail(ctx, cname, tail)
+		}
+		results = append(results, entry)
+	}
+	return &LogsResponse{Repo: repo, Worktree: worktree, Tail: tail, Services: results}, nil
 }
 
 func (s *Server) listContainers(ctx context.Context) ([]ListedContainer, error) {
@@ -824,6 +888,44 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, err := s.opStatus(r.Context(), repo, worktree, service)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func parseTailParam(raw string) (int, error) {
+	if raw == "" {
+		return defaultLogsTail, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid tail %q: %w", raw, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("tail must be positive, got %d", n)
+	}
+	if n > maxLogsTail {
+		n = maxLogsTail
+	}
+	return n, nil
+}
+
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	repo := r.URL.Query().Get("repo")
+	worktree := r.URL.Query().Get("worktree")
+	service := r.URL.Query().Get("service")
+	if repo == "" || worktree == "" {
+		writeError(w, http.StatusBadRequest, errors.New("repo and worktree query params required"))
+		return
+	}
+	tail, err := parseTailParam(r.URL.Query().Get("tail"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	resp, err := s.opLogs(r.Context(), repo, worktree, service, tail)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -941,6 +1043,19 @@ func (s *Server) tools() []mcpTool {
 		},
 		"required": []string{"repo", "worktree"},
 	}
+	logsSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"repo":     map[string]any{"type": "string", "description": "Repository name"},
+			"worktree": map[string]any{"type": "string", "description": "Worktree name"},
+			"service":  map[string]any{"type": "string", "description": "Optional single service type to filter to."},
+			"tail": map[string]any{
+				"type":        "integer",
+				"description": fmt.Sprintf("Number of trailing log lines per service (default %d, max %d).", defaultLogsTail, maxLogsTail),
+			},
+		},
+		"required": []string{"repo", "worktree"},
+	}
 	upSchema := map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -964,6 +1079,7 @@ func (s *Server) tools() []mcpTool {
 		{Name: "pgpool_down", Description: "Tear down services for a worktree. Defaults to all configured services.", InputSchema: rwSvc},
 		{Name: "pgpool_status", Description: "Report state of services for a worktree. Optionally filter to one service.", InputSchema: rwOptionalService},
 		{Name: "pgpool_list", Description: "List all pgpool-managed containers on this host.", InputSchema: empty},
+		{Name: "pgpool_logs", Description: "Tail container logs for one or all configured services in a worktree.", InputSchema: logsSchema},
 	}
 }
 
@@ -1076,6 +1192,26 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 			items = []ListedContainer{}
 		}
 		return items, nil
+	case "pgpool_logs":
+		var req struct {
+			Repo     string `json:"repo"`
+			Worktree string `json:"worktree"`
+			Service  string `json:"service"`
+			Tail     int    `json:"tail"`
+		}
+		if len(args) > 0 {
+			if err := json.Unmarshal(args, &req); err != nil {
+				return nil, fmt.Errorf("parse arguments: %w", err)
+			}
+		}
+		tail := req.Tail
+		if tail <= 0 {
+			tail = defaultLogsTail
+		}
+		if tail > maxLogsTail {
+			tail = maxLogsTail
+		}
+		return s.opLogs(ctx, req.Repo, req.Worktree, req.Service, tail)
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", name)
 	}
@@ -1156,6 +1292,7 @@ func main() {
 	mux.HandleFunc("POST /v1/up", srv.handleUp)
 	mux.HandleFunc("POST /v1/down", srv.handleDown)
 	mux.HandleFunc("GET /v1/status", srv.handleStatus)
+	mux.HandleFunc("GET /v1/logs", srv.handleLogs)
 	mux.HandleFunc("GET /v1/list", srv.handleList)
 	mux.HandleFunc("POST /mcp", srv.handleMCP)
 

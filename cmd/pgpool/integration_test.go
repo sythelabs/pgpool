@@ -110,6 +110,47 @@ func TestIntegration_MultiServiceUp(t *testing.T) {
 	}
 }
 
+func TestIntegration_LogsAfterUp(t *testing.T) {
+	s := newTestServer(t, []string{"postgres"})
+	ctx := context.Background()
+	defer s.opDown(ctx, DownRequest{Repo: "itest", Worktree: "logs"})
+
+	if _, err := s.opUp(ctx, UpRequest{Repo: "itest", Worktree: "logs"}); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	resp, err := s.opLogs(ctx, "itest", "logs", "", defaultLogsTail)
+	if err != nil {
+		t.Fatalf("logs: %v", err)
+	}
+	if len(resp.Services) != 1 || resp.Services[0].Type != "postgres" {
+		t.Fatalf("unexpected services: %+v", resp.Services)
+	}
+	if resp.Services[0].State != "running" {
+		t.Errorf("state = %q, want running", resp.Services[0].State)
+	}
+	if resp.Services[0].Logs == "" {
+		t.Error("expected non-empty logs from running postgres container")
+	}
+}
+
+func TestIntegration_LogsMissingContainer(t *testing.T) {
+	s := newTestServer(t, []string{"postgres"})
+	ctx := context.Background()
+	resp, err := s.opLogs(ctx, "itest", "no-such-worktree-zzz", "", defaultLogsTail)
+	if err != nil {
+		t.Fatalf("logs: %v", err)
+	}
+	if len(resp.Services) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(resp.Services))
+	}
+	if resp.Services[0].State != "missing" {
+		t.Errorf("state = %q, want missing", resp.Services[0].State)
+	}
+	if resp.Services[0].Logs != "" {
+		t.Errorf("missing container should not have logs: %q", resp.Services[0].Logs)
+	}
+}
+
 func TestIntegration_ScopedDownLeavesOthers(t *testing.T) {
 	s := newTestServer(t, []string{"postgres", "seaweedfs"})
 	ctx := context.Background()

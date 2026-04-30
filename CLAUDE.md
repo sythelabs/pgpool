@@ -35,13 +35,14 @@ Both are served from the same process on the same port. Choose whichever is conv
 - `POST /v1/up` - body `{"repo","worktree","services":["postgres","seaweedfs"]?, "image"?}` -> `{"services":[{type,container,volume,reused,endpoints:{role:{url,host_port,container_port}}}]}`. `services` defaults to the server's configured set; `image` (when present) applies to the postgres entry.
 - `POST /v1/down` - body `{"repo","worktree","services"?}` -> `{"services":[{type,container,volume}]}`. Defaults to the configured set.
 - `GET /v1/status?repo=X&worktree=Y[&service=Z]` -> `{repo,worktree,services:[...]}`. Optional `service` filter narrows to one entry.
+- `GET /v1/logs?repo=X&worktree=Y[&service=Z][&tail=N]` -> `{repo,worktree,tail,services:[{type,container,state,logs}]}`. Defaults to the configured service set; `tail` defaults to 100 and is capped at 5000. `state` is `running` | `stopped` | `missing`; `logs` is omitted when the container is missing.
 - `GET /v1/list` -> array of `{type,container,volume,repo,worktree,state,created_at,endpoints?}`. One row per pgpool-labelled container with a known `pgpool.service` value. Containers missing the label or labelled with an unknown service are excluded.
-- `GET /healthz` - liveness.
+- `GET /healthz` - liveness. Returns `{status,name,version}`; the version is the build's `serverVersion` and lets clients spot CLI/server skew.
 
 ### MCP
 
 - `POST /mcp` - JSON-RPC 2.0. Implements `initialize`, `tools/list`, `tools/call`, `ping`.
-- Tools: `pgpool_up`, `pgpool_down`, `pgpool_status`, `pgpool_list`. Up and down accept an optional `services: string[]`; status accepts an optional `service: string`. Schemas mirror REST.
+- Tools: `pgpool_up`, `pgpool_down`, `pgpool_status`, `pgpool_logs`, `pgpool_list`. Up and down accept an optional `services: string[]`; status and logs accept an optional `service: string`; logs additionally accepts `tail: integer`. Schemas mirror REST.
 - Tool call results are returned as a single `text` content block containing pretty-printed JSON. Errors set `isError: true`.
 
 ## Container naming

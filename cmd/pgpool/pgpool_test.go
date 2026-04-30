@@ -233,3 +233,57 @@ func TestOpDown_UnknownServiceReturnsNonNilResponse(t *testing.T) {
 		t.Fatal("opDown must return non-nil response so handlers can read resp.Services without panicking")
 	}
 }
+
+func TestOpLogs_RejectsEmptyRepoOrWorktree(t *testing.T) {
+	s := &Server{cfg: Config{DefaultServices: []string{"postgres"}}}
+	if _, err := s.opLogs(context.Background(), "", "wt", "", 50); err == nil {
+		t.Error("empty repo: expected error")
+	}
+	if _, err := s.opLogs(context.Background(), "r", "", "", 50); err == nil {
+		t.Error("empty worktree: expected error")
+	}
+}
+
+func TestOpLogs_UnknownServiceReturnsError(t *testing.T) {
+	s := &Server{cfg: Config{DefaultServices: []string{"postgres"}}}
+	if _, err := s.opLogs(context.Background(), "r", "w", "nope", 50); err == nil {
+		t.Fatal("expected error for unknown service")
+	}
+}
+
+func TestOpLogs_NoDefaultsAndNoSelectionReturnsError(t *testing.T) {
+	s := &Server{cfg: Config{DefaultServices: nil}}
+	if _, err := s.opLogs(context.Background(), "r", "w", "", 50); err == nil {
+		t.Fatal("expected error when no defaults and no service selection")
+	}
+}
+
+func TestParseTailParam(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int
+		wantErr bool
+	}{
+		{"", defaultLogsTail, false},
+		{"50", 50, false},
+		{"0", 0, true},
+		{"-3", 0, true},
+		{"abc", 0, true},
+		{"99999", maxLogsTail, false},
+	}
+	for _, tc := range cases {
+		got, err := parseTailParam(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("parseTailParam(%q) expected error, got %d", tc.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseTailParam(%q) unexpected error: %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Errorf("parseTailParam(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}

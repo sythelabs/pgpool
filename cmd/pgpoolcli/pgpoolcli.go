@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,7 +28,7 @@ import (
 const (
 	defaultURL        = "http://localhost:8080"
 	defaultConfigRel  = ".config/pgpool/pgpool.json"
-	claudeBeginMarker = "<!-- BEGIN PGPOOL INTEGRATION v:2 -->"
+	claudeBeginMarker = "<!-- BEGIN PGPOOL INTEGRATION v:3 -->"
 	claudeEndMarker   = "<!-- END PGPOOL INTEGRATION -->"
 	httpTimeout       = 60 * time.Second
 )
@@ -36,27 +37,33 @@ const (
 var cliVersion = "dev"
 
 // claudeSegment is what `pgpoolcli init` appends to CLAUDE.md.
-const claudeSegment = `<!-- BEGIN PGPOOL INTEGRATION v:2 -->
+const claudeSegment = `<!-- BEGIN PGPOOL INTEGRATION v:3 -->
 ## Per-worktree services (pgpool)
 This project uses **pgpoolcli** to manage ephemeral per-worktree services (Postgres and SeaweedFS supported today).
-Run ` + "`pgpoolcli prime`" + ` for full workflow context.
+Run ` + "`pgpoolcli prime`" + ` for full workflow context including the per-service endpoint catalog.
 ### Quick reference
 ` + "```bash" + `
 pgpoolcli up                  # bring up all configured services
 pgpoolcli up postgres         # just postgres
 pgpoolcli status              # show all services for this worktree
 pgpoolcli status seaweedfs    # filter to one service
+pgpoolcli logs                # tail logs for all services in this worktree
+pgpoolcli logs postgres       # tail logs for one service
 pgpoolcli list                # all pgpool-managed containers on the host
 pgpoolcli down                # tear everything down for this worktree
 pgpoolcli down postgres       # tear down only postgres
 ` + "```" + `
 Repo and worktree auto-detect from git. Override with ` + "`--repo`" + ` / ` + "`--worktree`" + `.
+### Endpoints
+- ` + "`postgres`" + `: ` + "`primary`" + ` role -> ` + "`postgresql://USER:PASS@HOST:PORT/DB`" + ` (credentials are server-configured).
+- ` + "`seaweedfs`" + `: ` + "`master`" + `, ` + "`volume`" + `, ` + "`filer`" + `, ` + "`s3`" + ` roles -> ` + "`http://HOST:PORT`" + ` per role.
 ### Rules
 - Use ` + "`pgpoolcli`" + ` to manage per-worktree services - do NOT hand-run ` + "`docker`" + ` commands against pgpool containers.
 - ` + "`pgpoolcli up`" + ` is per-service idempotent. Re-running brings up missing services and reuses existing ones.
 - ` + "`pgpoolcli down`" + ` destroys volumes - data is NOT recoverable.
 - The server does not write ` + "`.env`" + ` files - read endpoint URLs from ` + "`up`" + ` / ` + "`status`" + ` and write your own.
 - One container per (repo, worktree, service) tuple - names are derived, not chosen.
+- If ` + "`status`" + ` / ` + "`up`" + ` return empty service lists, the server is older than the CLI. Run ` + "`pgpoolcli health`" + ` to compare versions.
 <!-- END PGPOOL INTEGRATION -->`
 
 // primeText is what `pgpoolcli prime` prints. Gives an agent the full picture
@@ -81,11 +88,17 @@ Commands:
     Report state for every configured service in this worktree, or just the
     named service.
 
+  pgpoolcli logs [SERVICE] [--tail N]
+    Tail the most recent log lines for one service or all configured services
+    in this worktree. Default --tail is 100, max 5000.
+
   pgpoolcli list
     Inventory of every pgpool-managed container on the server's host.
 
   pgpoolcli health
-    Liveness check against the server.
+    Liveness check against the server. Prints the server version - if it does
+    not match the CLI version, status/up/list may return empty service lists
+    because the response shape changed.
 
   pgpoolcli config
     Print the resolved CLI config (url, config path, detected repo/worktree).
@@ -106,11 +119,39 @@ Auto-detection:
   --repo      basename of the origin remote URL, else basename of the git toplevel
   --worktree  basename of the current working directory
 
+Service catalog:
+  postgres
+    image:     postgres:17 (override per-call via the up "image" field)
+    endpoints: primary  (postgresql, container port 5432)
+    URL form:  postgresql://USER:PASS@HOST:HOSTPORT/DB
+    notes:     User, password, and DB are server-configured (--pg-user,
+               --pg-password, --pg-db). Read primary.url from up/status
+               responses; the server does not write a .env for you.
+
+  seaweedfs
+    image:     chrislusf/seaweedfs:3.71
+    endpoints: master  (http, container 9333) - cluster control plane
+               volume  (http, container 8080) - chunk storage
+               filer   (http, container 8888) - filesystem API
+               s3      (http, container 8333) - S3-compatible API
+    URL form:  http://HOST:HOSTPORT for each role
+    notes:     Readiness is checked against the master at /cluster/status.
+               Use the s3 endpoint with any S3 SDK; access keys are not
+               enforced in the default configuration.
+
 Typical flow inside a worktree:
   1. pgpoolcli up                # all services
   2. read connection URLs from each service's "endpoints" map
   3. write into your .env (the server does not do this for you)
-  4. pgpoolcli down              # when the worktree is done
+  4. pgpoolcli logs              # if a service does not look healthy
+  5. pgpoolcli down              # when the worktree is done
+
+Troubleshooting:
+  - "status returns no services" or "up returns no URLs" usually means the
+    server is on an older release than the CLI. Run pgpoolcli health to check
+    the server version and restart the server with the matching binary.
+  - "container does not exist" from logs means up has not been run yet (or
+    down has been run since).
 `
 
 // ---------- config ----------
@@ -315,6 +356,20 @@ type listedJSON struct {
 	Endpoints map[string]endpointJSON `json:"endpoints,omitempty"`
 }
 
+type serviceLogsJSON struct {
+	Type      string `json:"type"`
+	Container string `json:"container"`
+	State     string `json:"state"`
+	Logs      string `json:"logs,omitempty"`
+}
+
+type logsResponseJSON struct {
+	Repo     string            `json:"repo"`
+	Worktree string            `json:"worktree"`
+	Tail     int               `json:"tail"`
+	Services []serviceLogsJSON `json:"services"`
+}
+
 func printServiceBlock(svc serviceResultJSON, includeReused bool) {
 	fmt.Printf("\n=== %s ===\n", svc.Type)
 	fmt.Printf("container: %s\n", svc.Container)
@@ -452,6 +507,45 @@ func cmdList(rc *runCtx) error {
 			row.State,
 			endpointsSummary(row.Endpoints, 60),
 		)
+	}
+	return nil
+}
+
+func cmdLogs(rc *runCtx, repo, worktree, service string, tail int) error {
+	q := url.Values{}
+	q.Set("repo", repo)
+	q.Set("worktree", worktree)
+	if service != "" {
+		q.Set("service", service)
+	}
+	if tail > 0 {
+		q.Set("tail", strconv.Itoa(tail))
+	}
+	var resp logsResponseJSON
+	if err := rc.client.do(http.MethodGet, "/v1/logs?"+q.Encode(), nil, &resp); err != nil {
+		return err
+	}
+	if rc.jsonOnly {
+		return printJSON(resp)
+	}
+	if len(resp.Services) == 0 {
+		fmt.Println("(no services configured on the server)")
+		return nil
+	}
+	for _, svc := range resp.Services {
+		fmt.Printf("\n=== %s (%s) [%s] ===\n", svc.Type, svc.Container, svc.State)
+		if svc.State == "missing" {
+			fmt.Println("(container does not exist)")
+			continue
+		}
+		if svc.Logs == "" {
+			fmt.Println("(no log output)")
+			continue
+		}
+		fmt.Print(svc.Logs)
+		if !strings.HasSuffix(svc.Logs, "\n") {
+			fmt.Println()
+		}
 	}
 	return nil
 }
@@ -670,11 +764,12 @@ Usage:
   pgpoolcli <command> [flags]
 
 Commands:
-  up       Create or reuse a Postgres container for this worktree
-  down     Destroy the container and its volume
-  status   Show state and connection URL for this worktree
+  up       Create or reuse the configured services for this worktree
+  down     Destroy the services and their volumes for this worktree
+  status   Show state and connection URLs for this worktree
+  logs     Tail container logs for one or all services in this worktree
   list     List all pgpool-managed containers on the server
-  health   Check that the server is reachable
+  health   Check that the server is reachable (also reports server version)
   config   Print the resolved config
   init     Write a config file and append a block to CLAUDE.md
   prime    Print the full workflow reference
@@ -717,6 +812,8 @@ func main() {
 		runStatus(args)
 	case "list":
 		runList(args)
+	case "logs":
+		runLogs(args)
 	case "health":
 		runHealth(args)
 	case "config":
@@ -815,6 +912,36 @@ func runList(args []string) {
 	rc, err := newRunCtx(g)
 	fail(err)
 	fail(cmdList(rc))
+}
+
+func runLogs(args []string) {
+	fs := flag.NewFlagSet("logs", flag.ExitOnError)
+	var g globalFlags
+	addGlobalFlags(fs, &g)
+	repo := fs.String("repo", "", "repository name (defaults to git-detected)")
+	worktree := fs.String("worktree", "", "worktree name (defaults to $PWD basename)")
+	tail := fs.Int("tail", 0, "number of trailing log lines per service (server default applies when 0)")
+	must(fs.Parse(args))
+
+	if *repo == "" {
+		*repo = detectRepo()
+	}
+	if *worktree == "" {
+		*worktree = detectWorktree()
+	}
+	r, err := requireDetected("repo", *repo)
+	fail(err)
+	w, err := requireDetected("worktree", *worktree)
+	fail(err)
+
+	rc, err := newRunCtx(g)
+	fail(err)
+
+	var service string
+	if rest := fs.Args(); len(rest) > 0 {
+		service = rest[0]
+	}
+	fail(cmdLogs(rc, r, w, service, *tail))
 }
 
 func runHealth(args []string) {
