@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -208,5 +209,27 @@ func TestResolveServices(t *testing.T) {
 	_, err = empty.resolveServices(nil)
 	if err == nil {
 		t.Error("expected error when no defaults and no request")
+	}
+}
+
+func TestOpUp_UnknownServiceReturnsNonNilResponse(t *testing.T) {
+	s := &Server{cfg: Config{DefaultServices: []string{"postgres"}}}
+	resp, err := s.opUp(context.Background(), UpRequest{Repo: "r", Worktree: "w", Services: []string{"nope"}})
+	if err == nil {
+		t.Fatal("expected error for unknown service")
+	}
+	if resp == nil {
+		t.Fatal("opUp must return non-nil response so handlers can read resp.Services without panicking")
+	}
+}
+
+func TestOpDown_UnknownServiceReturnsNonNilResponse(t *testing.T) {
+	s := &Server{cfg: Config{DefaultServices: []string{"postgres"}}}
+	resp, err := s.opDown(context.Background(), DownRequest{Repo: "r", Worktree: "w", Services: []string{"nope"}})
+	if err == nil {
+		t.Fatal("expected error for unknown service")
+	}
+	if resp == nil {
+		t.Fatal("opDown must return non-nil response so handlers can read resp.Services without panicking")
 	}
 }

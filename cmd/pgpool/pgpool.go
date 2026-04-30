@@ -663,7 +663,7 @@ func (s *Server) resolveServices(requested []string) ([]ServiceDef, error) {
 func (s *Server) opUp(ctx context.Context, req UpRequest) (*UpResponse, error) {
 	defs, err := s.resolveServices(req.Services)
 	if err != nil {
-		return nil, err
+		return &UpResponse{}, err
 	}
 	results := make([]ServiceResult, 0, len(defs))
 	for _, def := range defs {
@@ -683,7 +683,7 @@ func (s *Server) opUp(ctx context.Context, req UpRequest) (*UpResponse, error) {
 func (s *Server) opDown(ctx context.Context, req DownRequest) (*DownResponse, error) {
 	defs, err := s.resolveServices(req.Services)
 	if err != nil {
-		return nil, err
+		return &DownResponse{}, err
 	}
 	results := make([]ServiceResult, 0, len(defs))
 	for _, def := range defs {
