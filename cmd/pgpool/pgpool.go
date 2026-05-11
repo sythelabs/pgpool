@@ -133,6 +133,37 @@ func init() {
 	serviceDefs[seaweedfsDef.Type] = seaweedfsDef
 }
 
+var fakeGCSDef = ServiceDef{
+	Type:            "fake-gcs",
+	ContainerPrefix: "gcs",
+	VolumePrefix:    "gcsvol",
+	Image:           "fsouza/fake-gcs-server:1.49",
+	DockerArgs: func(bc ServiceBuildCtx) []string {
+		return []string{"-v", bc.Volume + ":/storage"}
+	},
+	DockerCommand: func(bc ServiceBuildCtx) []string {
+		port := bc.HostPorts["storage"]
+		return []string{
+			"-scheme", "http",
+			"-public-host", bc.Cfg.AdvertiseHost + ":" + port,
+			"-external-url", "http://" + bc.Cfg.AdvertiseHost + ":" + port,
+		}
+	},
+	Endpoints: []EndpointSpec{
+		{Role: "storage", ContainerPort: 4443, Scheme: "http"},
+	},
+	Readiness: func(ctx context.Context, s *Server, _ string, bc ServiceBuildCtx) error {
+		return s.httpReady(ctx, "http://"+bc.Cfg.AdvertiseHost+":"+bc.HostPorts["storage"]+"/storage/v1/b")
+	},
+	BuildURL: func(bc ServiceBuildCtx, _, hostPort string) string {
+		return "http://" + bc.Cfg.AdvertiseHost + ":" + hostPort
+	},
+}
+
+func init() {
+	serviceDefs[fakeGCSDef.Type] = fakeGCSDef
+}
+
 // ---------- endpoint helpers ----------
 
 type EndpointInfo struct {

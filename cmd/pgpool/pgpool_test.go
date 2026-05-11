@@ -334,3 +334,52 @@ func TestReserveHostPorts_ReleasesListeners(t *testing.T) {
 	}
 	_ = l.Close()
 }
+
+func TestFakeGCS_RegisteredWithExpectedShape(t *testing.T) {
+	def, ok := serviceDefs["fake-gcs"]
+	if !ok {
+		t.Fatal("fake-gcs not registered")
+	}
+	if def.ContainerPrefix != "gcs" {
+		t.Errorf("ContainerPrefix = %q, want %q", def.ContainerPrefix, "gcs")
+	}
+	if def.VolumePrefix != "gcsvol" {
+		t.Errorf("VolumePrefix = %q, want %q", def.VolumePrefix, "gcsvol")
+	}
+	if len(def.Endpoints) != 1 || def.Endpoints[0].Role != "storage" || def.Endpoints[0].ContainerPort != 4443 {
+		t.Errorf("unexpected endpoints: %+v", def.Endpoints)
+	}
+	bc := ServiceBuildCtx{
+		Cfg:       Config{AdvertiseHost: "host.example"},
+		Volume:    "gcsvol-x-y",
+		Image:     def.Image,
+		HostPorts: map[string]string{"storage": "55555"},
+	}
+	args := def.DockerArgs(bc)
+	if len(args) < 2 || args[0] != "-v" || args[1] != "gcsvol-x-y:/storage" {
+		t.Errorf("DockerArgs unexpected: %v", args)
+	}
+	cmd := def.DockerCommand(bc)
+	wantPublic := "host.example:55555"
+	wantExternal := "http://host.example:55555"
+	if !containsAdjacent(cmd, "-public-host", wantPublic) {
+		t.Errorf("DockerCommand missing -public-host %q in %v", wantPublic, cmd)
+	}
+	if !containsAdjacent(cmd, "-external-url", wantExternal) {
+		t.Errorf("DockerCommand missing -external-url %q in %v", wantExternal, cmd)
+	}
+	gotURL := def.BuildURL(bc, "storage", "55555")
+	if gotURL != "http://host.example:55555" {
+		t.Errorf("BuildURL = %q, want %q", gotURL, "http://host.example:55555")
+	}
+}
+
+// containsAdjacent reports whether args contains flag followed immediately by value.
+func containsAdjacent(args []string, flag, value string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
