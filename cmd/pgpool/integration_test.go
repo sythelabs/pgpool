@@ -23,7 +23,7 @@ func dockerAvailable(t *testing.T) {
 func newTestServer(t *testing.T, services []string) *Server {
 	t.Helper()
 	dockerAvailable(t)
-	return &Server{cfg: Config{
+	return newServer(Config{
 		AdvertiseHost:   "localhost",
 		PgUser:          "postgres",
 		PgPassword:      "test-password-do-not-reuse",
@@ -31,7 +31,7 @@ func newTestServer(t *testing.T, services []string) *Server {
 		DockerBin:       "docker",
 		StartupTimeout:  90 * time.Second,
 		DefaultServices: services,
-	}}
+	})
 }
 
 func TestIntegration_PostgresLifecycle(t *testing.T) {
@@ -46,7 +46,7 @@ func TestIntegration_PostgresLifecycle(t *testing.T) {
 	if len(up.Services) != 1 || up.Services[0].Type != "postgres" {
 		t.Fatalf("unexpected up response: %+v", up)
 	}
-	primary, ok := up.Services[0].Endpoints["primary"]
+	primary, ok := up.Services[0].Endpoints[RolePrimary]
 	if !ok || primary.URL == "" {
 		t.Fatalf("missing primary endpoint: %+v", up.Services[0])
 	}
@@ -72,13 +72,13 @@ func TestIntegration_SeaweedfsLifecycle(t *testing.T) {
 	if len(up.Services) != 1 || up.Services[0].Type != "seaweedfs" {
 		t.Fatalf("unexpected up response: %+v", up)
 	}
-	for _, role := range []string{"master", "volume", "filer", "s3"} {
+	for _, role := range []EndpointRole{RoleMaster, RoleVolume, RoleFiler, RoleS3} {
 		ep, ok := up.Services[0].Endpoints[role]
 		if !ok || ep.HostPort == "" {
 			t.Errorf("missing endpoint %s", role)
 		}
 	}
-	master := up.Services[0].Endpoints["master"]
+	master := up.Services[0].Endpoints[RoleMaster]
 	resp, err := http.Get(master.URL + "/cluster/status")
 	if err != nil {
 		t.Fatalf("master GET: %v", err)
@@ -190,7 +190,7 @@ func TestIntegration_FakeGCSLifecycle(t *testing.T) {
 	if len(up.Services) != 1 || up.Services[0].Type != "fake-gcs" {
 		t.Fatalf("unexpected up response: %+v", up)
 	}
-	storage, ok := up.Services[0].Endpoints["storage"]
+	storage, ok := up.Services[0].Endpoints[RoleStorage]
 	if !ok || storage.URL == "" {
 		t.Fatalf("missing storage endpoint: %+v", up.Services[0])
 	}
@@ -321,7 +321,7 @@ func TestIntegration_ReloadFakeGCS(t *testing.T) {
 	if len(rel.Services) != 1 || rel.Services[0].Type != "fake-gcs" {
 		t.Fatalf("unexpected reload response: %+v", rel)
 	}
-	storage, ok := rel.Services[0].Endpoints["storage"]
+	storage, ok := rel.Services[0].Endpoints[RoleStorage]
 	if !ok || storage.URL == "" {
 		t.Fatalf("missing storage endpoint after reload: %+v", rel.Services[0])
 	}
@@ -333,5 +333,65 @@ func TestIntegration_ReloadFakeGCS(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		t.Fatalf("unexpected status %d after reload", resp.StatusCode)
+	}
+}
+
+// TestIntegration_ReloadDestroysFakeGCSData asserts the documented reload
+// contract for fake-gcs: bucket data is gone after a reload. Mirror of the
+// postgres sentinel test - exercises the same volume-destruction behaviour
+// against a different service so the contract is not postgres-specific.
+func TestIntegration_ReloadDestroysFakeGCSData(t *testing.T) {
+	s := newTestServer(t, []string{"fake-gcs"})
+	ctx := context.Background()
+	defer s.opDown(ctx, DownRequest{Repo: "itest", Worktree: "reload-gcs-data"})
+
+	up, err := s.opUp(ctx, UpRequest{Repo: "itest", Worktree: "reload-gcs-data"})
+	if err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	storage, ok := up.Services[0].Endpoints[RoleStorage]
+	if !ok || storage.URL == "" {
+		t.Fatalf("missing storage endpoint: %+v", up.Services[0])
+	}
+
+	httpC := &http.Client{Timeout: 5 * time.Second}
+
+	sentinelBucket := "sentinel-reload-bucket"
+	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		storage.URL+"/storage/v1/b?project=itest",
+		strings.NewReader(`{"name":"`+sentinelBucket+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createReq.Header.Set("Content-Type", "application/json")
+	createResp, err := httpC.Do(createReq)
+	if err != nil {
+		t.Fatalf("create sentinel bucket: %v", err)
+	}
+	createResp.Body.Close()
+	if createResp.StatusCode/100 != 2 {
+		t.Fatalf("create sentinel bucket status=%d", createResp.StatusCode)
+	}
+
+	rel, err := s.opReload(ctx, ReloadRequest{Repo: "itest", Worktree: "reload-gcs-data"})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(rel.Services) != 1 || rel.Services[0].State == "destroyed" {
+		t.Fatalf("unexpected reload result: %+v", rel)
+	}
+	newStorage, ok := rel.Services[0].Endpoints[RoleStorage]
+	if !ok || newStorage.URL == "" {
+		t.Fatalf("missing storage endpoint after reload: %+v", rel.Services[0])
+	}
+
+	listResp, err := httpC.Get(newStorage.URL + "/storage/v1/b?project=itest")
+	if err != nil {
+		t.Fatalf("list buckets post-reload: %v", err)
+	}
+	listBody, _ := io.ReadAll(listResp.Body)
+	listResp.Body.Close()
+	if strings.Contains(string(listBody), sentinelBucket) {
+		t.Fatalf("sentinel bucket %q still present after reload; volume not destroyed. body=%s", sentinelBucket, listBody)
 	}
 }

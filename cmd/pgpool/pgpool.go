@@ -40,8 +40,23 @@ const (
 
 // ---------- service registry ----------
 
+// EndpointRole names a logical port exposed by a service. Using a named
+// type (not bare string) lets callers refer to known roles via the Role*
+// constants below, which keeps typos reviewable rather than landing as
+// silent map misses at runtime.
+type EndpointRole string
+
+const (
+	RolePrimary EndpointRole = "primary"
+	RoleMaster  EndpointRole = "master"
+	RoleVolume  EndpointRole = "volume"
+	RoleFiler   EndpointRole = "filer"
+	RoleS3      EndpointRole = "s3"
+	RoleStorage EndpointRole = "storage"
+)
+
 type EndpointSpec struct {
-	Role          string // "primary" | "master" | "filer" | "s3" | "storage" | ...
+	Role          EndpointRole
 	ContainerPort int
 	Scheme        string // "postgresql" | "http" | ...
 }
@@ -49,11 +64,29 @@ type EndpointSpec struct {
 // ServiceBuildCtx is the single argument passed into per-service builder funcs.
 // Adding a new input here lets future services pick it up without churning every
 // existing ServiceDef.
+//
+// Image is the resolved image tag (per-call override already applied). It is
+// passed to docker run by containerRun and is also available to builders if
+// they ever need to switch flags by tag.
 type ServiceBuildCtx struct {
 	Cfg       Config
 	Volume    string
-	Image     string            // resolved (per-call override already applied)
-	HostPorts map[string]string // role -> pre-allocated host port (as decimal string)
+	Image     string
+	HostPorts map[EndpointRole]string // role -> pre-allocated host port (as decimal string)
+}
+
+// newServiceBuildCtx returns the base context for a service call. HostPorts is
+// nil; populate it via withHostPorts once reservations or lookups have run.
+func newServiceBuildCtx(cfg Config, volume, image string) ServiceBuildCtx {
+	return ServiceBuildCtx{Cfg: cfg, Volume: volume, Image: image}
+}
+
+// withHostPorts returns a copy of bc with HostPorts set. The original is left
+// alone so each phase of serviceUp gets an explicit, named transition rather
+// than relying on a mutating field.
+func (bc ServiceBuildCtx) withHostPorts(hp map[EndpointRole]string) ServiceBuildCtx {
+	bc.HostPorts = hp
+	return bc
 }
 
 type ServiceDef struct {
@@ -65,7 +98,7 @@ type ServiceDef struct {
 	DockerCommand   func(bc ServiceBuildCtx) []string                                            // args placed AFTER the image (container CMD)
 	Endpoints       []EndpointSpec
 	Readiness       func(ctx context.Context, s *Server, container string, bc ServiceBuildCtx) error
-	BuildURL        func(bc ServiceBuildCtx, role, hostPort string) string
+	BuildURL        func(bc ServiceBuildCtx, role EndpointRole, hostPort string) string
 }
 
 var serviceDefs = map[string]ServiceDef{}
@@ -84,12 +117,12 @@ var postgresDef = ServiceDef{
 		}
 	},
 	Endpoints: []EndpointSpec{
-		{Role: "primary", ContainerPort: 5432, Scheme: "postgresql"},
+		{Role: RolePrimary, ContainerPort: 5432, Scheme: "postgresql"},
 	},
 	Readiness: func(ctx context.Context, s *Server, container string, _ ServiceBuildCtx) error {
 		return s.pgIsReady(ctx, container)
 	},
-	BuildURL: func(bc ServiceBuildCtx, _, hostPort string) string {
+	BuildURL: func(bc ServiceBuildCtx, _ EndpointRole, hostPort string) string {
 		u := &url.URL{
 			Scheme: "postgresql",
 			User:   url.UserPassword(bc.Cfg.PgUser, bc.Cfg.PgPassword),
@@ -116,15 +149,15 @@ var seaweedfsDef = ServiceDef{
 		return []string{"server", "-dir=/data", "-master", "-volume", "-filer", "-s3"}
 	},
 	Endpoints: []EndpointSpec{
-		{Role: "master", ContainerPort: 9333, Scheme: "http"},
-		{Role: "volume", ContainerPort: 8080, Scheme: "http"},
-		{Role: "filer", ContainerPort: 8888, Scheme: "http"},
-		{Role: "s3", ContainerPort: 8333, Scheme: "http"},
+		{Role: RoleMaster, ContainerPort: 9333, Scheme: "http"},
+		{Role: RoleVolume, ContainerPort: 8080, Scheme: "http"},
+		{Role: RoleFiler, ContainerPort: 8888, Scheme: "http"},
+		{Role: RoleS3, ContainerPort: 8333, Scheme: "http"},
 	},
 	Readiness: func(ctx context.Context, s *Server, container string, bc ServiceBuildCtx) error {
-		return s.httpReady(ctx, "http://"+bc.Cfg.AdvertiseHost+":"+bc.HostPorts["master"]+"/cluster/status")
+		return s.httpReady(ctx, "http://"+bc.Cfg.AdvertiseHost+":"+bc.HostPorts[RoleMaster]+"/cluster/status")
 	},
-	BuildURL: func(bc ServiceBuildCtx, _, hostPort string) string {
+	BuildURL: func(bc ServiceBuildCtx, _ EndpointRole, hostPort string) string {
 		return fmt.Sprintf("http://%s:%s", bc.Cfg.AdvertiseHost, hostPort)
 	},
 }
@@ -142,7 +175,7 @@ var fakeGCSDef = ServiceDef{
 		return []string{"-v", bc.Volume + ":/storage"}
 	},
 	DockerCommand: func(bc ServiceBuildCtx) []string {
-		port := bc.HostPorts["storage"]
+		port := bc.HostPorts[RoleStorage]
 		return []string{
 			"-scheme", "http",
 			"-public-host", bc.Cfg.AdvertiseHost + ":" + port,
@@ -150,12 +183,12 @@ var fakeGCSDef = ServiceDef{
 		}
 	},
 	Endpoints: []EndpointSpec{
-		{Role: "storage", ContainerPort: 4443, Scheme: "http"},
+		{Role: RoleStorage, ContainerPort: 4443, Scheme: "http"},
 	},
 	Readiness: func(ctx context.Context, s *Server, _ string, bc ServiceBuildCtx) error {
-		return s.httpReady(ctx, "http://"+bc.Cfg.AdvertiseHost+":"+bc.HostPorts["storage"]+"/storage/v1/b")
+		return s.httpReady(ctx, "http://"+bc.Cfg.AdvertiseHost+":"+bc.HostPorts[RoleStorage]+"/storage/v1/b")
 	},
-	BuildURL: func(bc ServiceBuildCtx, _, hostPort string) string {
+	BuildURL: func(bc ServiceBuildCtx, _ EndpointRole, hostPort string) string {
 		return "http://" + bc.Cfg.AdvertiseHost + ":" + hostPort
 	},
 }
@@ -172,8 +205,8 @@ type EndpointInfo struct {
 	ContainerPort int    `json:"container_port"`
 }
 
-func buildEndpointInfo(bc ServiceBuildCtx, def ServiceDef, hostPorts map[string]string) map[string]EndpointInfo {
-	out := map[string]EndpointInfo{}
+func buildEndpointInfo(bc ServiceBuildCtx, def ServiceDef, hostPorts map[EndpointRole]string) map[EndpointRole]EndpointInfo {
+	out := map[EndpointRole]EndpointInfo{}
 	for _, e := range def.Endpoints {
 		hp, ok := hostPorts[e.Role]
 		if !ok {
@@ -203,8 +236,28 @@ type Config struct {
 	DefaultServices []string
 }
 
+// dockerExec runs a docker subcommand. Production wraps exec.CommandContext;
+// tests substitute a fake so reload/up/down can be exercised without docker.
+type dockerExec func(ctx context.Context, args ...string) (string, string, error)
+
 type Server struct {
-	cfg Config
+	cfg    Config
+	docker dockerExec
+}
+
+func newServer(cfg Config) *Server {
+	s := &Server{cfg: cfg}
+	s.docker = s.execDocker
+	return s
+}
+
+func (s *Server) execDocker(ctx context.Context, args ...string) (string, string, error) {
+	cmd := exec.CommandContext(ctx, s.cfg.DockerBin, args...)
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
 }
 
 // ---------- naming ----------
@@ -283,23 +336,22 @@ type containerJSON struct {
 	} `json:"State"`
 }
 
-func (s *Server) dockerCmd(ctx context.Context, args ...string) *exec.Cmd {
-	return exec.CommandContext(ctx, s.cfg.DockerBin, args...)
+func (s *Server) runDocker(ctx context.Context, args ...string) (string, string, error) {
+	return s.docker(ctx, args...)
 }
 
-func (s *Server) runDocker(ctx context.Context, args ...string) (string, string, error) {
-	cmd := s.dockerCmd(ctx, args...)
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	return stdout.String(), stderr.String(), err
+// isDockerNoSuchError reports whether a docker stderr blob is the well-known
+// "object does not exist" failure, regardless of the noun docker used
+// ("container" / "volume" / "object") and case. Centralised so remove/inspect
+// paths stay in sync if docker rewords its messages.
+func isDockerNoSuchError(stderr string) bool {
+	return strings.Contains(strings.ToLower(stderr), "no such")
 }
 
 func (s *Server) inspect(ctx context.Context, name string) (InspectState, error) {
 	out, errOut, err := s.runDocker(ctx, "inspect", name)
 	if err != nil {
-		if strings.Contains(errOut, "No such object") || strings.Contains(errOut, "no such") {
+		if isDockerNoSuchError(errOut) {
 			return InspectState{Exists: false}, nil
 		}
 		return InspectState{}, fmt.Errorf("docker inspect %s: %w: %s", name, err, strings.TrimSpace(errOut))
@@ -357,7 +409,7 @@ func (s *Server) volumeCreate(ctx context.Context, name string) error {
 func (s *Server) volumeRemove(ctx context.Context, name string) error {
 	_, errOut, err := s.runDocker(ctx, "volume", "rm", name)
 	if err != nil {
-		if strings.Contains(errOut, "No such volume") || strings.Contains(errOut, "no such") {
+		if isDockerNoSuchError(errOut) {
 			return nil
 		}
 		return fmt.Errorf("docker volume rm %s: %w: %s", name, err, strings.TrimSpace(errOut))
@@ -376,7 +428,7 @@ func (s *Server) containerStart(ctx context.Context, name string) error {
 func (s *Server) containerRemove(ctx context.Context, name string) error {
 	_, errOut, err := s.runDocker(ctx, "rm", "-f", name)
 	if err != nil {
-		if strings.Contains(errOut, "No such container") || strings.Contains(errOut, "no such") {
+		if isDockerNoSuchError(errOut) {
 			return nil
 		}
 		return fmt.Errorf("docker rm -f %s: %w: %s", name, err, strings.TrimSpace(errOut))
@@ -400,7 +452,9 @@ func (s *Server) containerRun(ctx context.Context, o runOpts) error {
 	for _, e := range o.def.Endpoints {
 		hp, ok := o.bc.HostPorts[e.Role]
 		if !ok || hp == "" {
-			return fmt.Errorf("%s: missing pre-allocated host port for role %q", o.def.Type, e.Role)
+			// Programmer error: reserveHostPorts must populate every role
+			// declared in def.Endpoints before containerRun is called.
+			panic(fmt.Sprintf("pgpool: %s: missing pre-allocated host port for role %q", o.def.Type, e.Role))
 		}
 		args = append(args, "-p", fmt.Sprintf("%s:%d", hp, e.ContainerPort))
 	}
@@ -425,17 +479,31 @@ func (s *Server) containerRun(ctx context.Context, o runOpts) error {
 func (s *Server) httpReady(ctx context.Context, url string) error {
 	deadline := time.Now().Add(s.cfg.StartupTimeout)
 	client := &http.Client{Timeout: 3 * time.Second}
+	var lastStatus int
+	var lastErr error
 	for {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		resp, err := client.Do(req)
-		if err == nil {
+		switch {
+		case err != nil:
+			lastErr = err
+		default:
 			resp.Body.Close()
+			lastStatus = resp.StatusCode
+			lastErr = nil
 			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
 				return nil
 			}
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("http readiness probe %s timed out after %s", url, s.cfg.StartupTimeout)
+			switch {
+			case lastStatus != 0:
+				return fmt.Errorf("http readiness probe %s timed out after %s; last status %d", url, s.cfg.StartupTimeout, lastStatus)
+			case lastErr != nil:
+				return fmt.Errorf("http readiness probe %s timed out after %s; last error: %v", url, s.cfg.StartupTimeout, lastErr)
+			default:
+				return fmt.Errorf("http readiness probe %s timed out after %s", url, s.cfg.StartupTimeout)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -492,19 +560,19 @@ func parseDockerLabels(s string) map[string]string {
 // ---------- service result types ----------
 
 type ServiceResult struct {
-	Type      string                  `json:"type"`
-	Container string                  `json:"container"`
-	Volume    string                  `json:"volume"`
-	State     string                  `json:"state,omitempty"`
-	CreatedAt string                  `json:"created_at,omitempty"`
-	Reused    bool                    `json:"reused,omitempty"`
-	Endpoints map[string]EndpointInfo `json:"endpoints,omitempty"`
+	Type      string                        `json:"type"`
+	Container string                        `json:"container"`
+	Volume    string                        `json:"volume"`
+	State     string                        `json:"state,omitempty"`
+	CreatedAt string                        `json:"created_at,omitempty"`
+	Reused    bool                          `json:"reused,omitempty"`
+	Endpoints map[EndpointRole]EndpointInfo `json:"endpoints,omitempty"`
 }
 
 // ---------- per-service primitives ----------
 
-func (s *Server) collectHostPorts(ctx context.Context, container string, def ServiceDef) (map[string]string, error) {
-	out := map[string]string{}
+func (s *Server) collectHostPorts(ctx context.Context, container string, def ServiceDef) (map[EndpointRole]string, error) {
+	out := map[EndpointRole]string{}
 	for _, e := range def.Endpoints {
 		hp, err := s.hostPort(ctx, container, e.ContainerPort)
 		if err != nil {
@@ -521,12 +589,10 @@ func (s *Server) collectHostPorts(ctx context.Context, container string, def Ser
 // DockerCommand can reference the host port at container-start time
 // (fake-gcs-server bakes its public URL into responses via -external-url).
 //
-// There is a small race between Close and `docker run -p PORT:CP`; on a
-// single-user dev host with no aggressive port consumers this is effectively
-// never hit. If it is, docker fails fast with a bind error that surfaces
-// unchanged to the caller.
-func reserveHostPorts(endpoints []EndpointSpec) (map[string]string, error) {
-	out := make(map[string]string, len(endpoints))
+// There is a small race between Close and `docker run -p PORT:CP`. If lost,
+// docker fails fast with a bind error that surfaces unchanged.
+func reserveHostPorts(endpoints []EndpointSpec) (map[EndpointRole]string, error) {
+	out := make(map[EndpointRole]string, len(endpoints))
 	listeners := make([]net.Listener, 0, len(endpoints))
 	defer func() {
 		for _, l := range listeners {
@@ -564,23 +630,14 @@ func (s *Server) serviceUp(ctx context.Context, def ServiceDef, repo, worktree, 
 		return ServiceResult{}, err
 	}
 
-	bc := ServiceBuildCtx{Cfg: s.cfg, Volume: vname, Image: image}
+	bc := newServiceBuildCtx(s.cfg, vname, image)
 	reused := false
 	switch {
 	case state.Exists && state.Running:
 		reused = true
 	case state.Exists && !state.Running:
-		if err := s.containerStart(ctx, cname); err != nil {
+		if err := s.adoptExistingContainer(ctx, def, cname, bc); err != nil {
 			return ServiceResult{}, err
-		}
-		hostPorts, err := s.collectHostPorts(ctx, cname, def)
-		if err != nil {
-			return ServiceResult{}, err
-		}
-		bc.HostPorts = hostPorts
-		if err := def.Readiness(ctx, s, cname, bc); err != nil {
-			tail := s.logsTail(ctx, cname, 50)
-			return ServiceResult{}, fmt.Errorf("%s: %w\nlast 50 log lines:\n%s", def.Type, err, tail)
 		}
 		reused = true
 	default:
@@ -591,29 +648,26 @@ func (s *Server) serviceUp(ctx context.Context, def ServiceDef, repo, worktree, 
 		if err != nil {
 			return ServiceResult{}, fmt.Errorf("%s: reserve host ports: %w", def.Type, err)
 		}
-		bc.HostPorts = hostPorts
+		runBC := bc.withHostPorts(hostPorts)
 		runErr := s.containerRun(ctx, runOpts{
-			def: def, container: cname, repo: normalize(repo), worktree: normalize(worktree), bc: bc,
+			def: def, container: cname, repo: normalize(repo), worktree: normalize(worktree), bc: runBC,
 		})
-		if runErr != nil {
-			if strings.Contains(runErr.Error(), "is already in use") {
-				state2, err2 := s.inspect(ctx, cname)
-				if err2 != nil {
-					return ServiceResult{}, err2
-				}
-				if !state2.Exists {
-					return ServiceResult{}, runErr
-				}
-				reused = true
-			} else {
-				return ServiceResult{}, runErr
-			}
-		}
-		if !reused {
-			if err := def.Readiness(ctx, s, cname, bc); err != nil {
+		switch {
+		case runErr == nil:
+			if err := def.Readiness(ctx, s, cname, runBC); err != nil {
 				tail := s.logsTail(ctx, cname, 50)
 				return ServiceResult{}, fmt.Errorf("%s: %w\nlast 50 log lines:\n%s", def.Type, err, tail)
 			}
+		case strings.Contains(runErr.Error(), "is already in use"):
+			// Lost the race: a concurrent caller created the container between
+			// our inspect and run. Treat as the "container exists" path - if it
+			// is stopped, start it; either way re-probe readiness.
+			if err := s.adoptExistingContainer(ctx, def, cname, bc); err != nil {
+				return ServiceResult{}, err
+			}
+			reused = true
+		default:
+			return ServiceResult{}, runErr
 		}
 	}
 
@@ -621,14 +675,43 @@ func (s *Server) serviceUp(ctx context.Context, def ServiceDef, repo, worktree, 
 	if err != nil {
 		return ServiceResult{}, err
 	}
-	bc.HostPorts = finalPorts
+	finalBC := bc.withHostPorts(finalPorts)
 	return ServiceResult{
 		Type:      def.Type,
 		Container: cname,
 		Volume:    vname,
 		Reused:    reused,
-		Endpoints: buildEndpointInfo(bc, def, finalPorts),
+		Endpoints: buildEndpointInfo(finalBC, def, finalPorts),
 	}, nil
+}
+
+// adoptExistingContainer starts an existing container if it is stopped, then
+// re-runs the service's readiness probe. Shared between the Exists && !Running
+// branch and the "name already in use" race-retry branch so both follow the
+// same start-then-probe contract.
+func (s *Server) adoptExistingContainer(ctx context.Context, def ServiceDef, cname string, bc ServiceBuildCtx) error {
+	state, err := s.inspect(ctx, cname)
+	if err != nil {
+		return err
+	}
+	if !state.Exists {
+		return fmt.Errorf("%s: container %s vanished during adopt", def.Type, cname)
+	}
+	if !state.Running {
+		if err := s.containerStart(ctx, cname); err != nil {
+			return err
+		}
+	}
+	hostPorts, err := s.collectHostPorts(ctx, cname, def)
+	if err != nil {
+		return err
+	}
+	probeBC := bc.withHostPorts(hostPorts)
+	if err := def.Readiness(ctx, s, cname, probeBC); err != nil {
+		tail := s.logsTail(ctx, cname, 50)
+		return fmt.Errorf("%s: %w\nlast 50 log lines:\n%s", def.Type, err, tail)
+	}
+	return nil
 }
 
 func (s *Server) serviceDown(ctx context.Context, def ServiceDef, repo, worktree string) (ServiceResult, error) {
@@ -677,7 +760,7 @@ func (s *Server) serviceStatus(ctx context.Context, def ServiceDef, repo, worktr
 	if err != nil {
 		return ServiceResult{}, err
 	}
-	bc := ServiceBuildCtx{Cfg: s.cfg, Volume: vname, Image: def.Image, HostPorts: hostPorts}
+	bc := newServiceBuildCtx(s.cfg, vname, def.Image).withHostPorts(hostPorts)
 	res.Endpoints = buildEndpointInfo(bc, def, hostPorts)
 	return res, nil
 }
@@ -688,7 +771,9 @@ type UpRequest struct {
 	Repo     string   `json:"repo"`
 	Worktree string   `json:"worktree"`
 	Services []string `json:"services,omitempty"`
-	Image    string   `json:"image,omitempty"` // optional, applies to postgres if present
+	// Image overrides the postgres image tag for this call only. Ignored for
+	// every other service type - those builders use def.Image.
+	Image string `json:"image,omitempty"`
 }
 
 type UpResponse struct {
@@ -699,11 +784,30 @@ type ReloadRequest struct {
 	Repo     string   `json:"repo"`
 	Worktree string   `json:"worktree"`
 	Services []string `json:"services,omitempty"`
-	Image    string   `json:"image,omitempty"`
+	// Image overrides the postgres image tag for this call only. Ignored for
+	// every other service type - those builders use def.Image.
+	Image string `json:"image,omitempty"`
 }
+
+// ServiceFailure describes which service failed during a reload and at which
+// phase. Phase is one of "down" or "up". A reload that aborts at "up" leaves
+// the named service's volume destroyed - Services in the enclosing response
+// will contain a corresponding entry with State="destroyed" so callers can
+// see what was wiped without parsing Err.
+type ServiceFailure struct {
+	Type  string `json:"type"`
+	Phase string `json:"phase"`
+	Err   string `json:"error"`
+}
+
+const (
+	reloadPhaseDown = "down"
+	reloadPhaseUp   = "up"
+)
 
 type ReloadResponse struct {
 	Services []ServiceResult `json:"services"`
+	Failed   *ServiceFailure `json:"failed,omitempty"`
 }
 
 type DownRequest struct {
@@ -723,14 +827,14 @@ type StatusResponse struct {
 }
 
 type ListedContainer struct {
-	Type      string                  `json:"type"`
-	Container string                  `json:"container"`
-	Volume    string                  `json:"volume,omitempty"`
-	Repo      string                  `json:"repo"`
-	Worktree  string                  `json:"worktree"`
-	State     string                  `json:"state"`
-	CreatedAt string                  `json:"created_at"`
-	Endpoints map[string]EndpointInfo `json:"endpoints,omitempty"`
+	Type      string                        `json:"type"`
+	Container string                        `json:"container"`
+	Volume    string                        `json:"volume,omitempty"`
+	Repo      string                        `json:"repo"`
+	Worktree  string                        `json:"worktree"`
+	State     string                        `json:"state"`
+	CreatedAt string                        `json:"created_at"`
+	Endpoints map[EndpointRole]EndpointInfo `json:"endpoints,omitempty"`
 }
 
 type ServiceLogs struct {
@@ -754,6 +858,11 @@ const (
 
 // ---------- multi-service operations ----------
 
+// errUnknownService is returned when a caller names a service that is not in
+// the registry, and is the signal handlers use to translate the result to a
+// 400 (caller's fault) rather than a 500 (server's fault).
+var errUnknownService = errors.New("unknown service")
+
 func (s *Server) resolveServices(requested []string) ([]ServiceDef, error) {
 	if len(requested) == 0 {
 		requested = s.cfg.DefaultServices
@@ -765,7 +874,7 @@ func (s *Server) resolveServices(requested []string) ([]ServiceDef, error) {
 	for _, name := range requested {
 		def, ok := serviceDefs[name]
 		if !ok {
-			return nil, fmt.Errorf("unknown service %q", name)
+			return nil, fmt.Errorf("%w: %q", errUnknownService, name)
 		}
 		out = append(out, def)
 	}
@@ -808,9 +917,15 @@ func (s *Server) opDown(ctx context.Context, req DownRequest) (*DownResponse, er
 	return &DownResponse{Services: results}, nil
 }
 
-// opReload is down-then-up per service. Same partial-failure semantics as opUp
-// and opDown: if service N fails, services 1..N-1 are already reloaded and
-// included in the response alongside the error.
+// opReload is down-then-up per service.
+//
+// Partial-failure contract: if service N fails, services 1..N-1 are already
+// reloaded (fresh containers + volumes) and included in resp.Services. The
+// failing service is captured in resp.Failed with Phase distinguishing whether
+// the failure happened in the down or up phase. If the up phase fails, the
+// service's volume has already been destroyed; resp.Services will include a
+// State="destroyed" entry for it so callers can see the data loss without
+// having to parse the error string.
 func (s *Server) opReload(ctx context.Context, req ReloadRequest) (*ReloadResponse, error) {
 	defs, err := s.resolveServices(req.Services)
 	if err != nil {
@@ -818,16 +933,34 @@ func (s *Server) opReload(ctx context.Context, req ReloadRequest) (*ReloadRespon
 	}
 	results := make([]ServiceResult, 0, len(defs))
 	for _, def := range defs {
-		if _, err := s.serviceDown(ctx, def, req.Repo, req.Worktree); err != nil {
-			return &ReloadResponse{Services: results}, fmt.Errorf("%s: down: %w", def.Type, err)
+		downRes, downErr := s.serviceDown(ctx, def, req.Repo, req.Worktree)
+		if downErr != nil {
+			wrapped := fmt.Errorf("%s: down: %w", def.Type, downErr)
+			return &ReloadResponse{
+				Services: results,
+				Failed:   &ServiceFailure{Type: def.Type, Phase: reloadPhaseDown, Err: downErr.Error()},
+			}, wrapped
 		}
 		image := ""
 		if def.Type == "postgres" {
 			image = req.Image
 		}
-		res, err := s.serviceUp(ctx, def, req.Repo, req.Worktree, image)
-		if err != nil {
-			return &ReloadResponse{Services: results}, fmt.Errorf("%s: up: %w", def.Type, err)
+		res, upErr := s.serviceUp(ctx, def, req.Repo, req.Worktree, image)
+		if upErr != nil {
+			// serviceDown succeeded - the volume is gone. Surface that as a
+			// State="destroyed" entry so callers see which service was wiped
+			// without scraping the error string.
+			results = append(results, ServiceResult{
+				Type:      def.Type,
+				Container: downRes.Container,
+				Volume:    downRes.Volume,
+				State:     "destroyed",
+			})
+			wrapped := fmt.Errorf("%s: up: %w", def.Type, upErr)
+			return &ReloadResponse{
+				Services: results,
+				Failed:   &ServiceFailure{Type: def.Type, Phase: reloadPhaseUp, Err: upErr.Error()},
+			}, wrapped
 		}
 		results = append(results, res)
 	}
@@ -839,7 +972,7 @@ func (s *Server) opStatus(ctx context.Context, repo, worktree, service string) (
 	if service != "" {
 		def, ok := serviceDefs[service]
 		if !ok {
-			return nil, fmt.Errorf("unknown service %q", service)
+			return nil, fmt.Errorf("%w: %q", errUnknownService, service)
 		}
 		defs = []ServiceDef{def}
 	} else {
@@ -868,7 +1001,7 @@ func (s *Server) opLogs(ctx context.Context, repo, worktree, service string, tai
 	if service != "" {
 		def, ok := serviceDefs[service]
 		if !ok {
-			return nil, fmt.Errorf("unknown service %q", service)
+			return nil, fmt.Errorf("%w: %q", errUnknownService, service)
 		}
 		defs = []ServiceDef{def}
 	} else {
@@ -942,8 +1075,10 @@ func (s *Server) listContainers(ctx context.Context) ([]ListedContainer, error) 
 		}
 		if row.State == "running" {
 			hostPorts, err := s.collectHostPorts(ctx, row.Names, def)
-			if err == nil {
-				bc := ServiceBuildCtx{Cfg: s.cfg, Volume: lc.Volume, Image: def.Image, HostPorts: hostPorts}
+			if err != nil {
+				log.Printf("pgpool: list: skipping endpoints for %s: %v", row.Names, err)
+			} else {
+				bc := newServiceBuildCtx(s.cfg, lc.Volume, def.Image).withHostPorts(hostPorts)
 				lc.Endpoints = buildEndpointInfo(bc, def, hostPorts)
 			}
 		}
@@ -972,7 +1107,11 @@ func (s *Server) handleUp(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := s.opUp(r.Context(), req)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
+		status := http.StatusInternalServerError
+		if errors.Is(err, errUnknownService) {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, map[string]any{
 			"error":    err.Error(),
 			"services": resp.Services,
 		})
@@ -989,7 +1128,11 @@ func (s *Server) handleDown(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := s.opDown(r.Context(), req)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
+		status := http.StatusInternalServerError
+		if errors.Is(err, errUnknownService) {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, map[string]any{
 			"error":    err.Error(),
 			"services": resp.Services,
 		})
@@ -1006,13 +1149,32 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := s.opReload(r.Context(), req)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error":    err.Error(),
-			"services": resp.Services,
-		})
+		status := http.StatusInternalServerError
+		if errors.Is(err, errUnknownService) {
+			status = http.StatusBadRequest
+		}
+		// Emit the typed response shape so callers can read resp.Services and
+		// resp.Failed exactly the same way as on success. The error string is
+		// also included in resp.Failed.Err.
+		writeJSON(w, status, reloadErrorResponse(resp, err))
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// reloadErrorResponse returns the body for a reload failure. When opReload
+// already populated resp.Failed (per-service failure) we emit that as-is.
+// When the failure is pre-flight (e.g. unknown-service), there is no failing
+// service yet, so a synthetic Failed entry carries the error message.
+func reloadErrorResponse(resp *ReloadResponse, err error) ReloadResponse {
+	if resp == nil {
+		resp = &ReloadResponse{}
+	}
+	out := ReloadResponse{Services: resp.Services, Failed: resp.Failed}
+	if out.Failed == nil {
+		out.Failed = &ServiceFailure{Err: err.Error()}
+	}
+	return out
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -1025,7 +1187,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := s.opStatus(r.Context(), repo, worktree, service)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		status := http.StatusInternalServerError
+		if errors.Is(err, errUnknownService) {
+			status = http.StatusBadRequest
+		}
+		writeError(w, status, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -1063,7 +1229,11 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := s.opLogs(r.Context(), repo, worktree, service, tail)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		status := http.StatusInternalServerError
+		if errors.Is(err, errUnknownService) {
+			status = http.StatusBadRequest
+		}
+		writeError(w, status, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -1429,7 +1599,7 @@ func main() {
 		}
 	}
 
-	srv := &Server{cfg: cfg}
+	srv := newServer(cfg)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleIndex)

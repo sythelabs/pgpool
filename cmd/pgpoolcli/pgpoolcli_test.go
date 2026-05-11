@@ -2,6 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,6 +95,89 @@ func TestCmdInit_CreatesFileWhenAbsent(t *testing.T) {
 	got, _ := initTestEnv(t, "")
 	if !bytes.Contains(got, []byte(claudeSegment)) {
 		t.Errorf("expected claudeSegment in fresh file:\n%s", got)
+	}
+}
+
+// TestCmdReload_HTTPRoundTrip wires cmdReload against an httptest server and
+// asserts: (1) the CLI POSTs to /v1/reload, (2) repo/worktree/services land
+// in the body, (3) the printed output names every service in the response.
+func TestCmdReload_HTTPRoundTrip(t *testing.T) {
+	var capturedPath, capturedMethod string
+	var capturedBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMethod = r.Method
+		capturedPath = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"services":[{"type":"postgres","container":"pg-r-w","volume":"pgvol-r-w","reused":false,"endpoints":{"primary":{"url":"postgresql://u:p@localhost:54321/d","host_port":"54321","container_port":5432}}}]}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	rc := &runCtx{client: newClient(srv.URL), url: srv.URL}
+	stdout, restore := captureStdout(t)
+	if err := cmdReload(rc, "r", "w", []string{"postgres"}); err != nil {
+		t.Fatalf("cmdReload: %v", err)
+	}
+	out := restore()
+	_ = stdout
+
+	if capturedMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", capturedMethod)
+	}
+	if capturedPath != "/v1/reload" {
+		t.Errorf("path = %q, want /v1/reload", capturedPath)
+	}
+	if capturedBody["repo"] != "r" || capturedBody["worktree"] != "w" {
+		t.Errorf("body missing repo/worktree: %+v", capturedBody)
+	}
+	services, _ := capturedBody["services"].([]any)
+	if len(services) != 1 || services[0] != "postgres" {
+		t.Errorf("body.services = %v, want [postgres]", services)
+	}
+	if !strings.Contains(out, "postgres") || !strings.Contains(out, "pg-r-w") {
+		t.Errorf("output missing service block: %q", out)
+	}
+}
+
+// TestCmdReload_SurfacesServerError asserts the CLI returns a non-nil error
+// when the server responds with 4xx/5xx (e.g. unknown service -> 400). The
+// CLI does not need to parse the Failed shape - exit-non-zero is enough.
+func TestCmdReload_SurfacesServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"services":[],"failed":{"type":"","phase":"","error":"unknown service: \"nope\""}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	rc := &runCtx{client: newClient(srv.URL), url: srv.URL}
+	err := cmdReload(rc, "r", "w", []string{"nope"})
+	if err == nil {
+		t.Fatal("expected error for 400 response")
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Errorf("error should mention 400: %v", err)
+	}
+}
+
+// captureStdout redirects os.Stdout into an in-memory pipe for the duration
+// of the returned closure. cmdReload writes through fmt.Print* which targets
+// os.Stdout, so swapping at the os level is the only way to capture without
+// threading a writer through the CLI plumbing.
+func captureStdout(t *testing.T) (*os.File, func() string) {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	return w, func() string {
+		w.Close()
+		os.Stdout = old
+		buf, _ := io.ReadAll(r)
+		return string(buf)
 	}
 }
 

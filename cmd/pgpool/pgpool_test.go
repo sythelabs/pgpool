@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestNormalize(t *testing.T) {
@@ -86,10 +90,10 @@ func TestBuildEndpointInfo(t *testing.T) {
 		PgPassword:    "p p",
 		PgDB:          "d",
 	}
-	hostPorts := map[string]string{"primary": "49160"}
+	hostPorts := map[EndpointRole]string{RolePrimary: "49160"}
 	bc := ServiceBuildCtx{Cfg: cfg, HostPorts: hostPorts}
 	endpoints := buildEndpointInfo(bc, postgresDef, hostPorts)
-	got, ok := endpoints["primary"]
+	got, ok := endpoints[RolePrimary]
 	if !ok {
 		t.Fatal("missing primary endpoint")
 	}
@@ -134,7 +138,7 @@ func TestServiceRegistry_Validity(t *testing.T) {
 		if def.DockerArgs == nil {
 			t.Errorf("%s: DockerArgs is nil", typ)
 		}
-		seenRoles := map[string]bool{}
+		seenRoles := map[EndpointRole]bool{}
 		for _, e := range def.Endpoints {
 			if e.Role == "" {
 				t.Errorf("%s: endpoint role is empty", typ)
@@ -315,7 +319,7 @@ func TestReserveHostPorts_AssignsDistinctNonZeroPorts(t *testing.T) {
 		t.Fatalf("want 3 entries, got %d: %v", len(got), got)
 	}
 	seen := map[string]bool{}
-	for _, role := range []string{"a", "b", "c"} {
+	for _, role := range []EndpointRole{"a", "b", "c"} {
 		p, ok := got[role]
 		if !ok {
 			t.Errorf("missing role %q in %v", role, got)
@@ -357,18 +361,18 @@ func TestFakeGCS_RegisteredWithExpectedShape(t *testing.T) {
 	if def.VolumePrefix != "gcsvol" {
 		t.Errorf("VolumePrefix = %q, want %q", def.VolumePrefix, "gcsvol")
 	}
-	if len(def.Endpoints) != 1 || def.Endpoints[0].Role != "storage" || def.Endpoints[0].ContainerPort != 4443 {
+	if len(def.Endpoints) != 1 || def.Endpoints[0].Role != RoleStorage || def.Endpoints[0].ContainerPort != 4443 {
 		t.Errorf("unexpected endpoints: %+v", def.Endpoints)
 	}
 	bc := ServiceBuildCtx{
 		Cfg:       Config{AdvertiseHost: "host.example"},
 		Volume:    "gcsvol-x-y",
 		Image:     def.Image,
-		HostPorts: map[string]string{"storage": "55555"},
+		HostPorts: map[EndpointRole]string{RoleStorage: "55555"},
 	}
 	args := def.DockerArgs(bc)
-	if len(args) < 2 || args[0] != "-v" || args[1] != "gcsvol-x-y:/storage" {
-		t.Errorf("DockerArgs unexpected: %v", args)
+	if !containsAdjacent(args, "-v", "gcsvol-x-y:/storage") {
+		t.Errorf("DockerArgs missing -v %q in %v", "gcsvol-x-y:/storage", args)
 	}
 	cmd := def.DockerCommand(bc)
 	wantPublic := "host.example:55555"
@@ -379,7 +383,7 @@ func TestFakeGCS_RegisteredWithExpectedShape(t *testing.T) {
 	if !containsAdjacent(cmd, "-external-url", wantExternal) {
 		t.Errorf("DockerCommand missing -external-url %q in %v", wantExternal, cmd)
 	}
-	gotURL := def.BuildURL(bc, "storage", "55555")
+	gotURL := def.BuildURL(bc, RoleStorage, "55555")
 	if gotURL != "http://host.example:55555" {
 		t.Errorf("BuildURL = %q, want %q", gotURL, "http://host.example:55555")
 	}
@@ -393,4 +397,142 @@ func containsAdjacent(args []string, flag, value string) bool {
 		}
 	}
 	return false
+}
+
+// TestOpReload_PartialFailureShape exercises the documented contract: when
+// service N's up phase fails after a successful down, the response carries
+// the prior services' success entries, a State="destroyed" entry for the
+// failing service, and a typed Failed{Phase:"up"}. The error string follows
+// the "<type>: up: <inner>" format.
+func TestOpReload_PartialFailureShape(t *testing.T) {
+	cfg := Config{
+		DefaultServices: []string{"postgres", "fake-gcs"},
+		AdvertiseHost:   "localhost",
+		PgUser:          "u",
+		PgPassword:      "p",
+		PgDB:            "d",
+		StartupTimeout:  100 * time.Millisecond,
+		DockerBin:       "docker",
+	}
+	s := &Server{cfg: cfg}
+	s.docker = newFakeDockerReloadPartial(t)
+
+	resp, err := s.opReload(context.Background(), ReloadRequest{
+		Repo: "r", Worktree: "w",
+		Services: []string{"postgres", "fake-gcs"},
+	})
+	if err == nil {
+		t.Fatal("expected error when fake-gcs up fails")
+	}
+	if !strings.HasPrefix(err.Error(), "fake-gcs: up: ") {
+		t.Errorf("error format: got %q, want prefix %q", err.Error(), "fake-gcs: up: ")
+	}
+	if resp == nil {
+		t.Fatal("nil response")
+	}
+	if resp.Failed == nil {
+		t.Fatal("Failed must be populated on partial failure")
+	}
+	if resp.Failed.Type != "fake-gcs" {
+		t.Errorf("Failed.Type = %q, want %q", resp.Failed.Type, "fake-gcs")
+	}
+	if resp.Failed.Phase != reloadPhaseUp {
+		t.Errorf("Failed.Phase = %q, want %q", resp.Failed.Phase, reloadPhaseUp)
+	}
+	if resp.Failed.Err == "" {
+		t.Error("Failed.Err must be non-empty")
+	}
+	if len(resp.Services) != 2 {
+		t.Fatalf("Services length = %d, want 2 (postgres up + fake-gcs destroyed), got %+v", len(resp.Services), resp.Services)
+	}
+	if resp.Services[0].Type != "postgres" || resp.Services[0].State == "destroyed" {
+		t.Errorf("first entry should be successful postgres: %+v", resp.Services[0])
+	}
+	if resp.Services[1].Type != "fake-gcs" || resp.Services[1].State != "destroyed" {
+		t.Errorf("second entry should be destroyed fake-gcs: %+v", resp.Services[1])
+	}
+}
+
+// newFakeDockerReloadPartial returns a fake dockerExec that walks through a
+// successful postgres reload and a failing fake-gcs up phase. State is enough
+// to satisfy serviceDown (rm -f + volume rm + inspect) and the first
+// serviceUp (inspect "no such" -> volume create -> run -> exec pg_isready ->
+// port lookup), and to fail the second serviceUp at "docker run".
+func newFakeDockerReloadPartial(t *testing.T) dockerExec {
+	t.Helper()
+	var runCalls int32
+	return func(ctx context.Context, args ...string) (string, string, error) {
+		if len(args) == 0 {
+			return "", "", errors.New("no args")
+		}
+		switch args[0] {
+		case "rm":
+			return "", "", nil
+		case "volume":
+			if len(args) > 1 && args[1] == "rm" {
+				return "", "", nil
+			}
+			if len(args) > 1 && args[1] == "create" {
+				return "", "", nil
+			}
+		case "inspect":
+			return "", "Error: No such object: " + args[1], errors.New("exit 1")
+		case "run":
+			n := atomic.AddInt32(&runCalls, 1)
+			if n == 2 {
+				return "", "Error response from daemon: container failed to start", errors.New("exit 1")
+			}
+			return "containerid\n", "", nil
+		case "exec":
+			return "accepting connections\n", "", nil
+		case "port":
+			return "0.0.0.0:54321\n", "", nil
+		case "logs":
+			return "fake logs\n", "", nil
+		}
+		return "", "fake docker: unhandled args " + strings.Join(args, " "), errors.New("unhandled")
+	}
+}
+
+// TestMCP_ReloadDispatch verifies tools/call name=pgpool_reload routes into
+// opReload. We trigger an unknown-service failure so the test does not need
+// a real or fake docker - only routing through the JSON-RPC dispatcher.
+func TestMCP_ReloadDispatch(t *testing.T) {
+	s := &Server{cfg: Config{DefaultServices: []string{"postgres"}}}
+
+	params, err := json.Marshal(map[string]any{
+		"name": "pgpool_reload",
+		"arguments": map[string]any{
+			"repo": "r", "worktree": "w",
+			"services": []string{"definitely-not-a-service"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal params: %v", err)
+	}
+	resp := s.dispatchMCP(context.Background(), jsonrpcReq{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage(`1`),
+		Method:  "tools/call",
+		Params:  params,
+	})
+	if resp.Error != nil {
+		t.Fatalf("unexpected rpc error: %+v", resp.Error)
+	}
+	result, ok := resp.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("result not a map: %T", resp.Result)
+	}
+	isErr, _ := result["isError"].(bool)
+	if !isErr {
+		t.Fatalf("expected isError=true for unknown service, got %+v", result)
+	}
+	content, _ := result["content"].([]map[string]any)
+	if len(content) == 0 {
+		t.Fatalf("expected content block, got %+v", result)
+	}
+	text, _ := content[0]["text"].(string)
+	if !strings.Contains(text, "unknown service") {
+		t.Errorf("expected unknown-service text in %q", text)
+	}
 }
