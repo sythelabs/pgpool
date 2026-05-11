@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,9 +41,19 @@ const (
 // ---------- service registry ----------
 
 type EndpointSpec struct {
-	Role          string // "primary" | "master" | "filer" | "s3" | ...
+	Role          string // "primary" | "master" | "filer" | "s3" | "storage" | ...
 	ContainerPort int
 	Scheme        string // "postgresql" | "http" | ...
+}
+
+// ServiceBuildCtx is the single argument passed into per-service builder funcs.
+// Adding a new input here lets future services pick it up without churning every
+// existing ServiceDef.
+type ServiceBuildCtx struct {
+	Cfg       Config
+	Volume    string
+	Image     string            // resolved (per-call override already applied)
+	HostPorts map[string]string // role -> pre-allocated host port (as decimal string)
 }
 
 type ServiceDef struct {
@@ -50,11 +61,11 @@ type ServiceDef struct {
 	ContainerPrefix string
 	VolumePrefix    string
 	Image           string
-	DockerArgs      func(cfg Config, volume string) []string  // flags placed BEFORE the image
-	DockerCommand   func(cfg Config) []string                 // args placed AFTER the image (the container CMD)
+	DockerArgs      func(bc ServiceBuildCtx) []string                                            // flags placed BEFORE the image
+	DockerCommand   func(bc ServiceBuildCtx) []string                                            // args placed AFTER the image (container CMD)
 	Endpoints       []EndpointSpec
-	Readiness       func(ctx context.Context, s *Server, container string, hostPorts map[string]string) error
-	BuildURL        func(cfg Config, role string, hostPort string) string
+	Readiness       func(ctx context.Context, s *Server, container string, bc ServiceBuildCtx) error
+	BuildURL        func(bc ServiceBuildCtx, role, hostPort string) string
 }
 
 var serviceDefs = map[string]ServiceDef{}
@@ -64,26 +75,26 @@ var postgresDef = ServiceDef{
 	ContainerPrefix: "pg",
 	VolumePrefix:    "pgvol",
 	Image:           "postgres:17",
-	DockerArgs: func(cfg Config, volume string) []string {
+	DockerArgs: func(bc ServiceBuildCtx) []string {
 		return []string{
-			"-v", volume + ":/var/lib/postgresql/data",
-			"-e", "POSTGRES_PASSWORD=" + cfg.PgPassword,
-			"-e", "POSTGRES_USER=" + cfg.PgUser,
-			"-e", "POSTGRES_DB=" + cfg.PgDB,
+			"-v", bc.Volume + ":/var/lib/postgresql/data",
+			"-e", "POSTGRES_PASSWORD=" + bc.Cfg.PgPassword,
+			"-e", "POSTGRES_USER=" + bc.Cfg.PgUser,
+			"-e", "POSTGRES_DB=" + bc.Cfg.PgDB,
 		}
 	},
 	Endpoints: []EndpointSpec{
 		{Role: "primary", ContainerPort: 5432, Scheme: "postgresql"},
 	},
-	Readiness: func(ctx context.Context, s *Server, container string, _ map[string]string) error {
+	Readiness: func(ctx context.Context, s *Server, container string, _ ServiceBuildCtx) error {
 		return s.pgIsReady(ctx, container)
 	},
-	BuildURL: func(cfg Config, role, hostPort string) string {
+	BuildURL: func(bc ServiceBuildCtx, _, hostPort string) string {
 		u := &url.URL{
 			Scheme: "postgresql",
-			User:   url.UserPassword(cfg.PgUser, cfg.PgPassword),
-			Host:   cfg.AdvertiseHost + ":" + hostPort,
-			Path:   cfg.PgDB,
+			User:   url.UserPassword(bc.Cfg.PgUser, bc.Cfg.PgPassword),
+			Host:   bc.Cfg.AdvertiseHost + ":" + hostPort,
+			Path:   bc.Cfg.PgDB,
 		}
 		return u.String()
 	},
@@ -98,10 +109,10 @@ var seaweedfsDef = ServiceDef{
 	ContainerPrefix: "weed",
 	VolumePrefix:    "weedvol",
 	Image:           "chrislusf/seaweedfs:3.71",
-	DockerArgs: func(_ Config, volume string) []string {
-		return []string{"-v", volume + ":/data"}
+	DockerArgs: func(bc ServiceBuildCtx) []string {
+		return []string{"-v", bc.Volume + ":/data"}
 	},
-	DockerCommand: func(_ Config) []string {
+	DockerCommand: func(_ ServiceBuildCtx) []string {
 		return []string{"server", "-dir=/data", "-master", "-volume", "-filer", "-s3"}
 	},
 	Endpoints: []EndpointSpec{
@@ -110,11 +121,11 @@ var seaweedfsDef = ServiceDef{
 		{Role: "filer", ContainerPort: 8888, Scheme: "http"},
 		{Role: "s3", ContainerPort: 8333, Scheme: "http"},
 	},
-	Readiness: func(ctx context.Context, s *Server, container string, hostPorts map[string]string) error {
-		return s.httpReady(ctx, "http://"+s.cfg.AdvertiseHost+":"+hostPorts["master"]+"/cluster/status")
+	Readiness: func(ctx context.Context, s *Server, container string, bc ServiceBuildCtx) error {
+		return s.httpReady(ctx, "http://"+bc.Cfg.AdvertiseHost+":"+bc.HostPorts["master"]+"/cluster/status")
 	},
-	BuildURL: func(cfg Config, role, hostPort string) string {
-		return fmt.Sprintf("http://%s:%s", cfg.AdvertiseHost, hostPort)
+	BuildURL: func(bc ServiceBuildCtx, _, hostPort string) string {
+		return fmt.Sprintf("http://%s:%s", bc.Cfg.AdvertiseHost, hostPort)
 	},
 }
 
@@ -130,7 +141,7 @@ type EndpointInfo struct {
 	ContainerPort int    `json:"container_port"`
 }
 
-func buildEndpointInfo(cfg Config, def ServiceDef, hostPorts map[string]string) map[string]EndpointInfo {
+func buildEndpointInfo(bc ServiceBuildCtx, def ServiceDef, hostPorts map[string]string) map[string]EndpointInfo {
 	out := map[string]EndpointInfo{}
 	for _, e := range def.Endpoints {
 		hp, ok := hostPorts[e.Role]
@@ -138,7 +149,7 @@ func buildEndpointInfo(cfg Config, def ServiceDef, hostPorts map[string]string) 
 			continue
 		}
 		out[e.Role] = EndpointInfo{
-			URL:           def.BuildURL(cfg, e.Role, hp),
+			URL:           def.BuildURL(bc, e.Role, hp),
 			HostPort:      hp,
 			ContainerPort: e.ContainerPort,
 		}
@@ -343,9 +354,10 @@ func (s *Server) containerRemove(ctx context.Context, name string) error {
 }
 
 type runOpts struct {
-	def                      ServiceDef
-	container, volume, image string
-	repo, worktree           string
+	def            ServiceDef
+	container      string
+	repo, worktree string
+	bc             ServiceBuildCtx
 }
 
 func (s *Server) containerRun(ctx context.Context, o runOpts) error {
@@ -355,18 +367,22 @@ func (s *Server) containerRun(ctx context.Context, o runOpts) error {
 		"--restart", "unless-stopped",
 	}
 	for _, e := range o.def.Endpoints {
-		args = append(args, "-p", fmt.Sprintf("0:%d", e.ContainerPort))
+		hp, ok := o.bc.HostPorts[e.Role]
+		if !ok || hp == "" {
+			return fmt.Errorf("%s: missing pre-allocated host port for role %q", o.def.Type, e.Role)
+		}
+		args = append(args, "-p", fmt.Sprintf("%s:%d", hp, e.ContainerPort))
 	}
-	args = append(args, o.def.DockerArgs(s.cfg, o.volume)...)
+	args = append(args, o.def.DockerArgs(o.bc)...)
 	args = append(args,
 		"--label", labelPgpool+"=true",
 		"--label", labelRepo+"="+o.repo,
 		"--label", labelWorktree+"="+o.worktree,
 		"--label", labelService+"="+o.def.Type,
 	)
-	args = append(args, o.image)
+	args = append(args, o.bc.Image)
 	if o.def.DockerCommand != nil {
-		args = append(args, o.def.DockerCommand(s.cfg)...)
+		args = append(args, o.def.DockerCommand(o.bc)...)
 	}
 	_, errOut, err := s.runDocker(ctx, args...)
 	if err != nil {
@@ -468,6 +484,36 @@ func (s *Server) collectHostPorts(ctx context.Context, container string, def Ser
 	return out, nil
 }
 
+// reserveHostPorts asks the kernel for one free TCP port per endpoint by
+// briefly opening then closing a listener on 127.0.0.1:0. The returned map is
+// role -> decimal port string. Used on the create path so DockerArgs and
+// DockerCommand can reference the host port at container-start time
+// (fake-gcs-server bakes its public URL into responses via -external-url).
+//
+// There is a small race between Close and `docker run -p PORT:CP`; on a
+// single-user dev host with no aggressive port consumers this is effectively
+// never hit. If it is, docker fails fast with a bind error that surfaces
+// unchanged to the caller.
+func reserveHostPorts(endpoints []EndpointSpec) (map[string]string, error) {
+	out := make(map[string]string, len(endpoints))
+	listeners := make([]net.Listener, 0, len(endpoints))
+	defer func() {
+		for _, l := range listeners {
+			_ = l.Close()
+		}
+	}()
+	for _, e := range endpoints {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, fmt.Errorf("listen 127.0.0.1:0 for role %q: %w", e.Role, err)
+		}
+		listeners = append(listeners, l)
+		addr := l.Addr().(*net.TCPAddr)
+		out[e.Role] = strconv.Itoa(addr.Port)
+	}
+	return out, nil
+}
+
 func (s *Server) serviceUp(ctx context.Context, def ServiceDef, repo, worktree, imageOverride string) (ServiceResult, error) {
 	cname, err := serviceContainerName(def.ContainerPrefix, repo, worktree)
 	if err != nil {
@@ -487,6 +533,7 @@ func (s *Server) serviceUp(ctx context.Context, def ServiceDef, repo, worktree, 
 		return ServiceResult{}, err
 	}
 
+	bc := ServiceBuildCtx{Cfg: s.cfg, Volume: vname, Image: image}
 	reused := false
 	switch {
 	case state.Exists && state.Running:
@@ -499,7 +546,8 @@ func (s *Server) serviceUp(ctx context.Context, def ServiceDef, repo, worktree, 
 		if err != nil {
 			return ServiceResult{}, err
 		}
-		if err := def.Readiness(ctx, s, cname, hostPorts); err != nil {
+		bc.HostPorts = hostPorts
+		if err := def.Readiness(ctx, s, cname, bc); err != nil {
 			tail := s.logsTail(ctx, cname, 50)
 			return ServiceResult{}, fmt.Errorf("%s: %w\nlast 50 log lines:\n%s", def.Type, err, tail)
 		}
@@ -508,9 +556,13 @@ func (s *Server) serviceUp(ctx context.Context, def ServiceDef, repo, worktree, 
 		if err := s.volumeCreate(ctx, vname); err != nil {
 			return ServiceResult{}, err
 		}
+		hostPorts, err := reserveHostPorts(def.Endpoints)
+		if err != nil {
+			return ServiceResult{}, fmt.Errorf("%s: reserve host ports: %w", def.Type, err)
+		}
+		bc.HostPorts = hostPorts
 		runErr := s.containerRun(ctx, runOpts{
-			def: def, container: cname, volume: vname, image: image,
-			repo: normalize(repo), worktree: normalize(worktree),
+			def: def, container: cname, repo: normalize(repo), worktree: normalize(worktree), bc: bc,
 		})
 		if runErr != nil {
 			if strings.Contains(runErr.Error(), "is already in use") {
@@ -527,27 +579,24 @@ func (s *Server) serviceUp(ctx context.Context, def ServiceDef, repo, worktree, 
 			}
 		}
 		if !reused {
-			hostPorts, err := s.collectHostPorts(ctx, cname, def)
-			if err != nil {
-				return ServiceResult{}, err
-			}
-			if err := def.Readiness(ctx, s, cname, hostPorts); err != nil {
+			if err := def.Readiness(ctx, s, cname, bc); err != nil {
 				tail := s.logsTail(ctx, cname, 50)
 				return ServiceResult{}, fmt.Errorf("%s: %w\nlast 50 log lines:\n%s", def.Type, err, tail)
 			}
 		}
 	}
 
-	hostPorts, err := s.collectHostPorts(ctx, cname, def)
+	finalPorts, err := s.collectHostPorts(ctx, cname, def)
 	if err != nil {
 		return ServiceResult{}, err
 	}
+	bc.HostPorts = finalPorts
 	return ServiceResult{
 		Type:      def.Type,
 		Container: cname,
 		Volume:    vname,
 		Reused:    reused,
-		Endpoints: buildEndpointInfo(s.cfg, def, hostPorts),
+		Endpoints: buildEndpointInfo(bc, def, finalPorts),
 	}, nil
 }
 
@@ -597,7 +646,8 @@ func (s *Server) serviceStatus(ctx context.Context, def ServiceDef, repo, worktr
 	if err != nil {
 		return ServiceResult{}, err
 	}
-	res.Endpoints = buildEndpointInfo(s.cfg, def, hostPorts)
+	bc := ServiceBuildCtx{Cfg: s.cfg, Volume: vname, Image: def.Image, HostPorts: hostPorts}
+	res.Endpoints = buildEndpointInfo(bc, def, hostPorts)
 	return res, nil
 }
 
@@ -825,7 +875,8 @@ func (s *Server) listContainers(ctx context.Context) ([]ListedContainer, error) 
 		if row.State == "running" {
 			hostPorts, err := s.collectHostPorts(ctx, row.Names, def)
 			if err == nil {
-				lc.Endpoints = buildEndpointInfo(s.cfg, def, hostPorts)
+				bc := ServiceBuildCtx{Cfg: s.cfg, Volume: lc.Volume, Image: def.Image, HostPorts: hostPorts}
+				lc.Endpoints = buildEndpointInfo(bc, def, hostPorts)
 			}
 		}
 		results = append(results, lc)

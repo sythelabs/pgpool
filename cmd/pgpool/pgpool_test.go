@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net"
 	"strings"
 	"testing"
 )
@@ -86,7 +87,8 @@ func TestBuildEndpointInfo(t *testing.T) {
 		PgDB:          "d",
 	}
 	hostPorts := map[string]string{"primary": "49160"}
-	endpoints := buildEndpointInfo(cfg, postgresDef, hostPorts)
+	bc := ServiceBuildCtx{Cfg: cfg, HostPorts: hostPorts}
+	endpoints := buildEndpointInfo(bc, postgresDef, hostPorts)
 	got, ok := endpoints["primary"]
 	if !ok {
 		t.Fatal("missing primary endpoint")
@@ -181,7 +183,7 @@ func TestSeaweedfs_HasDockerCommand(t *testing.T) {
 	if def.DockerCommand == nil {
 		t.Fatal("seaweedfs DockerCommand is nil")
 	}
-	cmd := def.DockerCommand(Config{})
+	cmd := def.DockerCommand(ServiceBuildCtx{})
 	if len(cmd) == 0 || cmd[0] != "server" {
 		t.Errorf("unexpected command: %v", cmd)
 	}
@@ -286,4 +288,49 @@ func TestParseTailParam(t *testing.T) {
 			t.Errorf("parseTailParam(%q) = %d, want %d", tc.in, got, tc.want)
 		}
 	}
+}
+
+func TestReserveHostPorts_AssignsDistinctNonZeroPorts(t *testing.T) {
+	endpoints := []EndpointSpec{
+		{Role: "a", ContainerPort: 1111, Scheme: "http"},
+		{Role: "b", ContainerPort: 2222, Scheme: "http"},
+		{Role: "c", ContainerPort: 3333, Scheme: "http"},
+	}
+	got, err := reserveHostPorts(endpoints)
+	if err != nil {
+		t.Fatalf("reserveHostPorts: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("want 3 entries, got %d: %v", len(got), got)
+	}
+	seen := map[string]bool{}
+	for _, role := range []string{"a", "b", "c"} {
+		p, ok := got[role]
+		if !ok {
+			t.Errorf("missing role %q in %v", role, got)
+			continue
+		}
+		if p == "" || p == "0" {
+			t.Errorf("role %q got zero/empty port %q", role, p)
+		}
+		if seen[p] {
+			t.Errorf("duplicate port %q for role %q", p, role)
+		}
+		seen[p] = true
+	}
+}
+
+func TestReserveHostPorts_ReleasesListeners(t *testing.T) {
+	endpoints := []EndpointSpec{{Role: "a", ContainerPort: 1, Scheme: "http"}}
+	got, err := reserveHostPorts(endpoints)
+	if err != nil {
+		t.Fatalf("reserveHostPorts: %v", err)
+	}
+	port := got["a"]
+	addr := "127.0.0.1:" + port
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("reserved port %s could not be rebound: %v", port, err)
+	}
+	_ = l.Close()
 }
