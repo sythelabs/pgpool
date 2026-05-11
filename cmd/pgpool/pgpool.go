@@ -695,6 +695,17 @@ type UpResponse struct {
 	Services []ServiceResult `json:"services"`
 }
 
+type ReloadRequest struct {
+	Repo     string   `json:"repo"`
+	Worktree string   `json:"worktree"`
+	Services []string `json:"services,omitempty"`
+	Image    string   `json:"image,omitempty"`
+}
+
+type ReloadResponse struct {
+	Services []ServiceResult `json:"services"`
+}
+
 type DownRequest struct {
 	Repo     string   `json:"repo"`
 	Worktree string   `json:"worktree"`
@@ -795,6 +806,32 @@ func (s *Server) opDown(ctx context.Context, req DownRequest) (*DownResponse, er
 		results = append(results, res)
 	}
 	return &DownResponse{Services: results}, nil
+}
+
+// opReload is down-then-up per service. Same partial-failure semantics as opUp
+// and opDown: if service N fails, services 1..N-1 are already reloaded and
+// included in the response alongside the error.
+func (s *Server) opReload(ctx context.Context, req ReloadRequest) (*ReloadResponse, error) {
+	defs, err := s.resolveServices(req.Services)
+	if err != nil {
+		return &ReloadResponse{}, err
+	}
+	results := make([]ServiceResult, 0, len(defs))
+	for _, def := range defs {
+		if _, err := s.serviceDown(ctx, def, req.Repo, req.Worktree); err != nil {
+			return &ReloadResponse{Services: results}, fmt.Errorf("%s: down: %w", def.Type, err)
+		}
+		image := ""
+		if def.Type == "postgres" {
+			image = req.Image
+		}
+		res, err := s.serviceUp(ctx, def, req.Repo, req.Worktree, image)
+		if err != nil {
+			return &ReloadResponse{Services: results}, fmt.Errorf("%s: up: %w", def.Type, err)
+		}
+		results = append(results, res)
+	}
+	return &ReloadResponse{Services: results}, nil
 }
 
 func (s *Server) opStatus(ctx context.Context, repo, worktree, service string) (*StatusResponse, error) {

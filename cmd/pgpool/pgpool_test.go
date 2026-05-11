@@ -236,6 +236,17 @@ func TestOpDown_UnknownServiceReturnsNonNilResponse(t *testing.T) {
 	}
 }
 
+func TestOpReload_UnknownServiceReturnsNonNilResponse(t *testing.T) {
+	s := &Server{cfg: Config{DefaultServices: []string{"postgres"}}}
+	resp, err := s.opReload(context.Background(), ReloadRequest{Repo: "r", Worktree: "w", Services: []string{"nope"}})
+	if err == nil {
+		t.Fatal("expected error for unknown service")
+	}
+	if resp == nil {
+		t.Fatal("opReload must return non-nil response so handlers can read resp.Services without panicking")
+	}
+}
+
 func TestOpLogs_RejectsEmptyRepoOrWorktree(t *testing.T) {
 	s := &Server{cfg: Config{DefaultServices: []string{"postgres"}}}
 	if _, err := s.opLogs(context.Background(), "", "wt", "", 50); err == nil {
