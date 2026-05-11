@@ -258,3 +258,80 @@ func TestIntegration_FakeGCSLifecycle(t *testing.T) {
 		t.Errorf("mediaLink %q does not include host port %s", obj.MediaLink, storage.HostPort)
 	}
 }
+
+func TestIntegration_ReloadDestroysPostgresData(t *testing.T) {
+	s := newTestServer(t, []string{"postgres"})
+	ctx := context.Background()
+	defer s.opDown(ctx, DownRequest{Repo: "itest", Worktree: "reload-pg"})
+
+	up, err := s.opUp(ctx, UpRequest{Repo: "itest", Worktree: "reload-pg"})
+	if err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	cname := up.Services[0].Container
+
+	if _, _, err := s.runDocker(ctx, "exec", cname,
+		"psql", "-U", s.cfg.PgUser, "-d", s.cfg.PgDB,
+		"-c", "create table sentinel (x int); insert into sentinel values (1);",
+	); err != nil {
+		t.Fatalf("seed sentinel: %v", err)
+	}
+
+	rel, err := s.opReload(ctx, ReloadRequest{Repo: "itest", Worktree: "reload-pg"})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(rel.Services) != 1 || rel.Services[0].Type != "postgres" {
+		t.Fatalf("unexpected reload response: %+v", rel)
+	}
+	newName := rel.Services[0].Container
+	if newName != cname {
+		t.Logf("note: container name changed across reload: %s -> %s", cname, newName)
+	}
+
+	_, errOut, err := s.runDocker(ctx, "exec", newName,
+		"psql", "-U", s.cfg.PgUser, "-d", s.cfg.PgDB,
+		"-c", "select count(*) from sentinel;",
+	)
+	if err == nil {
+		t.Fatalf("expected error querying sentinel table after reload; got success. stderr: %s", errOut)
+	}
+	if !strings.Contains(errOut, "does not exist") && !strings.Contains(errOut, "relation \"sentinel\"") {
+		t.Fatalf("expected 'does not exist' error, got: %s", errOut)
+	}
+}
+
+func TestIntegration_ReloadFakeGCS(t *testing.T) {
+	s := newTestServer(t, []string{"fake-gcs"})
+	ctx := context.Background()
+	defer s.opDown(ctx, DownRequest{Repo: "itest", Worktree: "reload-gcs"})
+
+	up, err := s.opUp(ctx, UpRequest{Repo: "itest", Worktree: "reload-gcs"})
+	if err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	if len(up.Services) != 1 {
+		t.Fatalf("unexpected up: %+v", up)
+	}
+
+	rel, err := s.opReload(ctx, ReloadRequest{Repo: "itest", Worktree: "reload-gcs", Services: []string{"fake-gcs"}})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(rel.Services) != 1 || rel.Services[0].Type != "fake-gcs" {
+		t.Fatalf("unexpected reload response: %+v", rel)
+	}
+	storage, ok := rel.Services[0].Endpoints["storage"]
+	if !ok || storage.URL == "" {
+		t.Fatalf("missing storage endpoint after reload: %+v", rel.Services[0])
+	}
+
+	resp, err := http.Get(storage.URL + "/storage/v1/b?project=itest")
+	if err != nil {
+		t.Fatalf("storage endpoint not reachable post-reload: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		t.Fatalf("unexpected status %d after reload", resp.StatusCode)
+	}
+}
