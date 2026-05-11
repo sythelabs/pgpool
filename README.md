@@ -1,7 +1,7 @@
 # pgpool
 
-Single-binary server that manages ephemeral per-worktree services (Postgres
-and SeaweedFS today, more services pluggable via a Go service registry), plus
+Single-binary server that manages ephemeral per-worktree services (Postgres,
+SeaweedFS, and fake-gcs-server today, more services pluggable via a Go service registry), plus
 a thin CLI (`pgpoolcli`) for clients. Clients speak HTTP (REST or MCP JSON-RPC);
 the server shells out to `docker`. Designed for multi-agent workflows where
 many agents thrash on features and need isolated, ephemeral infra per worktree.
@@ -89,6 +89,8 @@ pgpoolcli status seaweedfs  # filter to one service
 pgpoolcli logs              # tail logs for every service in this worktree
 pgpoolcli logs postgres     # tail logs for one service
 pgpoolcli list              # every pgpool-managed container on the server
+pgpoolcli reload            # down-then-up everything for this worktree (destroys volumes)
+pgpoolcli reload postgres   # reload just postgres
 pgpoolcli down              # tear everything down for this worktree
 pgpoolcli down postgres     # tear down only postgres
 ```
@@ -143,9 +145,9 @@ Running `pgpoolcli init` in a project appends the block below to `CLAUDE.md`
 make re-running `init` idempotent - it will not duplicate.
 
 ```markdown
-<!-- BEGIN PGPOOL INTEGRATION v:3 -->
+<!-- BEGIN PGPOOL INTEGRATION v:4 -->
 ## Per-worktree services (pgpool)
-This project uses **pgpoolcli** to manage ephemeral per-worktree services (Postgres and SeaweedFS supported today).
+This project uses **pgpoolcli** to manage ephemeral per-worktree services (Postgres, SeaweedFS, and fake-gcs-server supported today).
 Run `pgpoolcli prime` for full workflow context including the per-service endpoint catalog.
 ### Quick reference
 ```bash
@@ -156,6 +158,8 @@ pgpoolcli status seaweedfs    # filter to one service
 pgpoolcli logs                # tail logs for all services in this worktree
 pgpoolcli logs postgres       # tail logs for one service
 pgpoolcli list                # all pgpool-managed containers on the host
+pgpoolcli reload              # down-then-up everything for this worktree (destroys volumes)
+pgpoolcli reload postgres     # reload just postgres
 pgpoolcli down                # tear everything down for this worktree
 pgpoolcli down postgres       # tear down only postgres
 ```
@@ -163,10 +167,12 @@ Repo and worktree auto-detect from git. Override with `--repo` / `--worktree`.
 ### Endpoints
 - `postgres`: `primary` role -> `postgresql://USER:PASS@HOST:PORT/DB` (credentials are server-configured).
 - `seaweedfs`: `master`, `volume`, `filer`, `s3` roles -> `http://HOST:PORT` per role.
+- `fake-gcs`: `storage` role -> `http://HOST:PORT` (GCS-compatible JSON API; point clients via `STORAGE_EMULATOR_HOST`).
 ### Rules
 - Use `pgpoolcli` to manage per-worktree services - do NOT hand-run `docker` commands against pgpool containers.
-- `pgpoolcli up` is per-service idempotent.
+- `pgpoolcli up` is per-service idempotent. Re-running brings up missing services and reuses existing ones.
 - `pgpoolcli down` destroys volumes - data is NOT recoverable.
+- `pgpoolcli reload` is `down` followed by `up` per service - it ALSO destroys volumes. Use `up` to bring missing services up without losing data.
 - The server does not write `.env` files - read endpoint URLs from `up` / `status` and write your own.
 - One container per (repo, worktree, service) tuple - names are derived, not chosen.
 - If `status` / `up` return empty service lists, the server is older than the CLI. Run `pgpoolcli health` to compare versions.
@@ -184,14 +190,15 @@ The CLI is a thin wrapper. If you want to hit the server directly:
 ```
 POST /v1/up      {"repo","worktree","services":[...]?,"image"?}
 POST /v1/down    {"repo","worktree","services":[...]?}
+POST /v1/reload  {"repo","worktree","services":[...]?,"image"?}
 GET  /v1/status  ?repo=X&worktree=Y[&service=Z]
 GET  /v1/logs    ?repo=X&worktree=Y[&service=Z][&tail=N]
 GET  /v1/list
 GET  /healthz
-POST /mcp        JSON-RPC 2.0 - tools: pgpool_up, pgpool_down, pgpool_status, pgpool_logs, pgpool_list
+POST /mcp        JSON-RPC 2.0 - tools: pgpool_up, pgpool_down, pgpool_reload, pgpool_status, pgpool_logs, pgpool_list
 ```
 
-`up` and `down` default to the server's `--services` set when `services` is omitted. Responses always have a `services` array; each entry has its own `endpoints` map keyed by role (`primary` for postgres; `master`/`volume`/`filer`/`s3` for seaweedfs).
+`up` and `down` default to the server's `--services` set when `services` is omitted. Responses always have a `services` array; each entry has its own `endpoints` map keyed by role (`primary` for postgres; `master`/`volume`/`filer`/`s3` for seaweedfs; `storage` for fake-gcs).
 
 ## Security posture
 
