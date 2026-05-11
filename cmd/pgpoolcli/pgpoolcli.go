@@ -462,6 +462,26 @@ func cmdDown(rc *runCtx, repo, worktree string, services []string) error {
 	return nil
 }
 
+func cmdReload(rc *runCtx, repo, worktree string, services []string) error {
+	body := map[string]any{"repo": repo, "worktree": worktree}
+	if len(services) > 0 {
+		body["services"] = services
+	}
+	var resp struct {
+		Services []serviceResultJSON `json:"services"`
+	}
+	if err := rc.client.do(http.MethodPost, "/v1/reload", body, &resp); err != nil {
+		return err
+	}
+	if rc.jsonOnly {
+		return printJSON(resp)
+	}
+	for _, svc := range resp.Services {
+		printServiceBlock(svc, true)
+	}
+	return nil
+}
+
 func cmdStatus(rc *runCtx, repo, worktree, service string) error {
 	q := url.Values{}
 	q.Set("repo", repo)
@@ -812,6 +832,7 @@ Usage:
 Commands:
   up       Create or reuse the configured services for this worktree
   down     Destroy the services and their volumes for this worktree
+  reload   Down-then-up the services for this worktree (destroys volumes)
   status   Show state and connection URLs for this worktree
   logs     Tail container logs for one or all services in this worktree
   list     List all pgpool-managed containers on the server
@@ -854,6 +875,8 @@ func main() {
 		runUp(args)
 	case "down":
 		runDown(args)
+	case "reload":
+		runReload(args)
 	case "status":
 		runStatus(args)
 	case "list":
@@ -919,6 +942,30 @@ func runDown(args []string) {
 	rc, err := newRunCtx(g)
 	fail(err)
 	fail(cmdDown(rc, r, w, fs.Args()))
+}
+
+func runReload(args []string) {
+	fs := flag.NewFlagSet("reload", flag.ExitOnError)
+	var g globalFlags
+	addGlobalFlags(fs, &g)
+	repo := fs.String("repo", "", "repository name (defaults to git-detected)")
+	worktree := fs.String("worktree", "", "worktree name (defaults to $PWD basename)")
+	must(fs.Parse(args))
+
+	if *repo == "" {
+		*repo = detectRepo()
+	}
+	if *worktree == "" {
+		*worktree = detectWorktree()
+	}
+	r, err := requireDetected("repo", *repo)
+	fail(err)
+	w, err := requireDetected("worktree", *worktree)
+	fail(err)
+
+	rc, err := newRunCtx(g)
+	fail(err)
+	fail(cmdReload(rc, r, w, fs.Args()))
 }
 
 func runStatus(args []string) {
