@@ -1213,6 +1213,7 @@ func (s *Server) tools() []mcpTool {
 	return []mcpTool{
 		{Name: "pgpool_up", Description: "Bring up the configured services for a worktree. Returns one entry per service with its endpoints.", InputSchema: upSchema},
 		{Name: "pgpool_down", Description: "Tear down services for a worktree. Defaults to all configured services.", InputSchema: rwSvc},
+		{Name: "pgpool_reload", Description: "Tear down then re-create services for a worktree (destroys volumes). Defaults to all configured services.", InputSchema: upSchema},
 		{Name: "pgpool_status", Description: "Report state of services for a worktree. Optionally filter to one service.", InputSchema: rwOptionalService},
 		{Name: "pgpool_list", Description: "List all pgpool-managed containers on this host.", InputSchema: empty},
 		{Name: "pgpool_logs", Description: "Tail container logs for one or all configured services in a worktree.", InputSchema: logsSchema},
@@ -1307,6 +1308,14 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 			}
 		}
 		return s.opDown(ctx, req)
+	case "pgpool_reload":
+		var req ReloadRequest
+		if len(args) > 0 {
+			if err := json.Unmarshal(args, &req); err != nil {
+				return nil, fmt.Errorf("parse arguments: %w", err)
+			}
+		}
+		return s.opReload(ctx, req)
 	case "pgpool_status":
 		var req struct {
 			Repo     string `json:"repo"`
