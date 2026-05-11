@@ -998,6 +998,23 @@ func (s *Server) handleDown(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
+	var req ReloadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("parse body: %w", err))
+		return
+	}
+	resp, err := s.opReload(r.Context(), req)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":    err.Error(),
+			"services": resp.Services,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get("repo")
 	worktree := r.URL.Query().Get("worktree")
@@ -1410,6 +1427,7 @@ func main() {
 	mux.HandleFunc("GET /healthz", srv.handleHealth)
 	mux.HandleFunc("POST /v1/up", srv.handleUp)
 	mux.HandleFunc("POST /v1/down", srv.handleDown)
+	mux.HandleFunc("POST /v1/reload", srv.handleReload)
 	mux.HandleFunc("GET /v1/status", srv.handleStatus)
 	mux.HandleFunc("GET /v1/logs", srv.handleLogs)
 	mux.HandleFunc("GET /v1/list", srv.handleList)
