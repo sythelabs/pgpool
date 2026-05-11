@@ -1,6 +1,6 @@
 # pgpool
 
-Single-binary server that manages ephemeral per-worktree services on the host it runs on. Each (repo, worktree) pair can run a configured set of services side-by-side; today's registry contains `postgres` and `seaweedfs`. Clients connect over HTTP (REST or MCP JSON-RPC); the server shells out to the local `docker` binary to create, inspect, and destroy containers.
+Single-binary server that manages ephemeral per-worktree services on the host it runs on. Each (repo, worktree) pair can run a configured set of services side-by-side; today's registry contains `postgres`, `seaweedfs`, and `fake-gcs`. Clients connect over HTTP (REST or MCP JSON-RPC); the server shells out to the local `docker` binary to create, inspect, and destroy containers.
 
 ## Shape of the project
 
@@ -34,6 +34,7 @@ Both are served from the same process on the same port. Choose whichever is conv
 
 - `POST /v1/up` - body `{"repo","worktree","services":["postgres","seaweedfs"]?, "image"?}` -> `{"services":[{type,container,volume,reused,endpoints:{role:{url,host_port,container_port}}}]}`. `services` defaults to the server's configured set; `image` (when present) applies to the postgres entry.
 - `POST /v1/down` - body `{"repo","worktree","services"?}` -> `{"services":[{type,container,volume}]}`. Defaults to the configured set.
+- `POST /v1/reload` - body `{"repo","worktree","services"?, "image"?}` -> same shape as `/v1/up`. Equivalent to running `down` then `up` per service. Volumes are destroyed.
 - `GET /v1/status?repo=X&worktree=Y[&service=Z]` -> `{repo,worktree,services:[...]}`. Optional `service` filter narrows to one entry.
 - `GET /v1/logs?repo=X&worktree=Y[&service=Z][&tail=N]` -> `{repo,worktree,tail,services:[{type,container,state,logs}]}`. Defaults to the configured service set; `tail` defaults to 100 and is capped at 5000. `state` is `running` | `stopped` | `missing`; `logs` is omitted when the container is missing.
 - `GET /v1/list` -> array of `{type,container,volume,repo,worktree,state,created_at,endpoints?}`. One row per pgpool-labelled container with a known `pgpool.service` value. Containers missing the label or labelled with an unknown service are excluded.
@@ -42,13 +43,13 @@ Both are served from the same process on the same port. Choose whichever is conv
 ### MCP
 
 - `POST /mcp` - JSON-RPC 2.0. Implements `initialize`, `tools/list`, `tools/call`, `ping`.
-- Tools: `pgpool_up`, `pgpool_down`, `pgpool_status`, `pgpool_logs`, `pgpool_list`. Up and down accept an optional `services: string[]`; status and logs accept an optional `service: string`; logs additionally accepts `tail: integer`. Schemas mirror REST.
+- Tools: `pgpool_up`, `pgpool_down`, `pgpool_reload`, `pgpool_status`, `pgpool_logs`, `pgpool_list`. Up and reload accept an optional `services: string[]`; down accepts the same; status and logs accept an optional `service: string`; logs additionally accepts `tail: integer`. Schemas mirror REST.
 - Tool call results are returned as a single `text` content block containing pretty-printed JSON. Errors set `isError: true`.
 
 ## Container naming
 
-- Container: `<service-prefix>-<repo>-<worktree>` - `pg-` for postgres, `weed-` for seaweedfs.
-- Volume: `<service-volume-prefix>-<repo>-<worktree>` - `pgvol-` for postgres, `weedvol-` for seaweedfs.
+- Container: `<service-prefix>-<repo>-<worktree>` - `pg-` for postgres, `weed-` for seaweedfs, `gcs-` for fake-gcs.
+- Volume: `<service-volume-prefix>-<repo>-<worktree>` - `pgvol-` for postgres, `weedvol-` for seaweedfs, `gcsvol-` for fake-gcs.
 - Names are normalized to `[a-z0-9-]`, runs of `-` collapsed, leading/trailing `-` stripped.
 - If the composed name exceeds 63 chars (Docker limit), `<worktree>` is truncated and an 8-char SHA-256 prefix is appended. A warning is logged.
 - All managed containers carry labels: `pgpool=true`, `pgpool.repo=<repo>`, `pgpool.worktree=<worktree>`, `pgpool.service=<type>`. `list` filters on `pgpool=true`.
@@ -58,9 +59,11 @@ Both are served from the same process on the same port. Choose whichever is conv
 - `up` is idempotent per service. Running it twice returns the same endpoints, does not wipe data, does not recreate containers.
 - `up` on an existing-but-stopped container starts it and re-runs the service's readiness probe.
 - `up` on a missing container creates the volume (idempotent), runs the container with a `0:<container-port>` mapping per declared endpoint, and polls readiness every 500ms until `startup-timeout` (default 30s).
+- `up` on a missing container reserves one free host port per declared endpoint *before* `docker run`, so services whose CLI flags need their public URL at startup (e.g. fake-gcs-server's `-external-url`) can have it baked in. There is a small race window between port reservation and bind; if Docker fails to bind, the error is surfaced unchanged.
 - `down` always destroys both the container and the volume for the named service. Missing container or missing volume is a successful no-op.
 - Multi-service `up` and `down` process services sequentially. If service N fails, services 1..N-1 stay up; the response includes the partial successes plus an error.
 - The server never auto-starts containers on its own boot. Clients must call `up`.
+- `reload` is `down` then `up` per service. Volumes are destroyed - this is the documented contract, not a bug. Use `up` if you only need to bring missing services online without losing data.
 
 ## Configuration
 
