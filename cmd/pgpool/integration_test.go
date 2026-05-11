@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -175,4 +176,85 @@ func TestIntegration_ScopedDownLeavesOthers(t *testing.T) {
 		}
 	}
 	_ = json.Marshal // keep import in case future tests need it
+}
+
+func TestIntegration_FakeGCSLifecycle(t *testing.T) {
+	s := newTestServer(t, []string{"fake-gcs"})
+	ctx := context.Background()
+	defer s.opDown(ctx, DownRequest{Repo: "itest", Worktree: "gcs"})
+
+	up, err := s.opUp(ctx, UpRequest{Repo: "itest", Worktree: "gcs"})
+	if err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	if len(up.Services) != 1 || up.Services[0].Type != "fake-gcs" {
+		t.Fatalf("unexpected up response: %+v", up)
+	}
+	storage, ok := up.Services[0].Endpoints["storage"]
+	if !ok || storage.URL == "" {
+		t.Fatalf("missing storage endpoint: %+v", up.Services[0])
+	}
+
+	httpC := &http.Client{Timeout: 5 * time.Second}
+
+	// Create a bucket via the GCS-compatible JSON API.
+	createBody := `{"name":"itest-bucket"}`
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, storage.URL+"/storage/v1/b?project=itest", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpC.Do(req)
+	if err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		t.Fatalf("create bucket status=%d", resp.StatusCode)
+	}
+
+	// List buckets and confirm ours is present.
+	listResp, err := httpC.Get(storage.URL + "/storage/v1/b?project=itest")
+	if err != nil {
+		t.Fatalf("list buckets: %v", err)
+	}
+	listBody, _ := io.ReadAll(listResp.Body)
+	listResp.Body.Close()
+	if !strings.Contains(string(listBody), "itest-bucket") {
+		t.Fatalf("itest-bucket not in list response: %s", listBody)
+	}
+
+	// Upload an object. fake-gcs's object response embeds the -external-url
+	// in selfLink and mediaLink, so we can verify the advertise-host:port
+	// plumbing without depending on bucket-list selfLink (which 1.49 omits).
+	uploadURL := storage.URL + "/upload/storage/v1/b/itest-bucket/o?uploadType=media&name=hello.txt"
+	uploadReq, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, strings.NewReader("hi"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadReq.Header.Set("Content-Type", "text/plain")
+	uploadResp, err := httpC.Do(uploadReq)
+	if err != nil {
+		t.Fatalf("upload object: %v", err)
+	}
+	objBody, _ := io.ReadAll(uploadResp.Body)
+	uploadResp.Body.Close()
+	if uploadResp.StatusCode/100 != 2 {
+		t.Fatalf("upload status=%d body=%s", uploadResp.StatusCode, objBody)
+	}
+
+	var obj struct {
+		SelfLink  string `json:"selfLink"`
+		MediaLink string `json:"mediaLink"`
+	}
+	if err := json.Unmarshal(objBody, &obj); err != nil {
+		t.Fatalf("decode object body: %v: %s", err, objBody)
+	}
+	wantHostPort := ":" + storage.HostPort
+	if !strings.Contains(obj.SelfLink, wantHostPort) {
+		t.Errorf("selfLink %q does not include host port %s", obj.SelfLink, storage.HostPort)
+	}
+	if !strings.Contains(obj.MediaLink, wantHostPort) {
+		t.Errorf("mediaLink %q does not include host port %s", obj.MediaLink, storage.HostPort)
+	}
 }
