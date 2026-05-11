@@ -52,8 +52,8 @@ old pgpool docs that should disappear
 	if bytes.Contains(got, []byte("v:1")) {
 		t.Errorf("old v:1 marker still present:\n%s", got)
 	}
-	if !bytes.Contains(got, []byte("v:3")) {
-		t.Errorf("new v:3 marker missing:\n%s", got)
+	if !bytes.Contains(got, []byte("v:4")) {
+		t.Errorf("new v:4 marker missing:\n%s", got)
 	}
 	if bytes.Contains(got, []byte("old pgpool docs that should disappear")) {
 		t.Errorf("old block body still present:\n%s", got)
@@ -91,5 +91,30 @@ func TestCmdInit_CreatesFileWhenAbsent(t *testing.T) {
 	got, _ := initTestEnv(t, "")
 	if !bytes.Contains(got, []byte(claudeSegment)) {
 		t.Errorf("expected claudeSegment in fresh file:\n%s", got)
+	}
+}
+
+func TestCmdInit_ReplacesV3WithV4(t *testing.T) {
+	const oldBlock = `<!-- BEGIN PGPOOL INTEGRATION v:3 -->
+old v3 body
+<!-- END PGPOOL INTEGRATION -->`
+	seed := "# Project\n\n" + oldBlock + "\n"
+
+	got, _ := initTestEnv(t, seed)
+
+	if bytes.Count(got, []byte("<!-- BEGIN PGPOOL INTEGRATION")) != 1 {
+		t.Fatalf("want exactly one block, got:\n%s", got)
+	}
+	if bytes.Contains(got, []byte("v:3")) {
+		t.Errorf("v:3 marker should be gone:\n%s", got)
+	}
+	if !bytes.Contains(got, []byte("v:4")) {
+		t.Errorf("v:4 marker missing:\n%s", got)
+	}
+	if !bytes.Contains(got, []byte("pgpoolcli reload")) {
+		t.Errorf("expected reload to be mentioned in updated segment:\n%s", got)
+	}
+	if !bytes.Contains(got, []byte("fake-gcs")) {
+		t.Errorf("expected fake-gcs to be mentioned in updated segment:\n%s", got)
 	}
 }

@@ -39,9 +39,9 @@ const (
 var cliVersion = "dev"
 
 // claudeSegment is what `pgpoolcli init` appends to CLAUDE.md.
-const claudeSegment = `<!-- BEGIN PGPOOL INTEGRATION v:3 -->
+const claudeSegment = `<!-- BEGIN PGPOOL INTEGRATION v:4 -->
 ## Per-worktree services (pgpool)
-This project uses **pgpoolcli** to manage ephemeral per-worktree services (Postgres and SeaweedFS supported today).
+This project uses **pgpoolcli** to manage ephemeral per-worktree services (Postgres, SeaweedFS, and fake-gcs-server supported today).
 Run ` + "`pgpoolcli prime`" + ` for full workflow context including the per-service endpoint catalog.
 ### Quick reference
 ` + "```bash" + `
@@ -52,6 +52,8 @@ pgpoolcli status seaweedfs    # filter to one service
 pgpoolcli logs                # tail logs for all services in this worktree
 pgpoolcli logs postgres       # tail logs for one service
 pgpoolcli list                # all pgpool-managed containers on the host
+pgpoolcli reload              # down-then-up everything for this worktree (destroys volumes)
+pgpoolcli reload postgres     # reload just postgres
 pgpoolcli down                # tear everything down for this worktree
 pgpoolcli down postgres       # tear down only postgres
 ` + "```" + `
@@ -59,10 +61,12 @@ Repo and worktree auto-detect from git. Override with ` + "`--repo`" + ` / ` + "
 ### Endpoints
 - ` + "`postgres`" + `: ` + "`primary`" + ` role -> ` + "`postgresql://USER:PASS@HOST:PORT/DB`" + ` (credentials are server-configured).
 - ` + "`seaweedfs`" + `: ` + "`master`" + `, ` + "`volume`" + `, ` + "`filer`" + `, ` + "`s3`" + ` roles -> ` + "`http://HOST:PORT`" + ` per role.
+- ` + "`fake-gcs`" + `: ` + "`storage`" + ` role -> ` + "`http://HOST:PORT`" + ` (GCS-compatible JSON API; point clients via ` + "`STORAGE_EMULATOR_HOST`" + `).
 ### Rules
 - Use ` + "`pgpoolcli`" + ` to manage per-worktree services - do NOT hand-run ` + "`docker`" + ` commands against pgpool containers.
 - ` + "`pgpoolcli up`" + ` is per-service idempotent. Re-running brings up missing services and reuses existing ones.
 - ` + "`pgpoolcli down`" + ` destroys volumes - data is NOT recoverable.
+- ` + "`pgpoolcli reload`" + ` is ` + "`down`" + ` followed by ` + "`up`" + ` per service - it ALSO destroys volumes. Use ` + "`up`" + ` to bring missing services up without losing data.
 - The server does not write ` + "`.env`" + ` files - read endpoint URLs from ` + "`up`" + ` / ` + "`status`" + ` and write your own.
 - One container per (repo, worktree, service) tuple - names are derived, not chosen.
 - If ` + "`status`" + ` / ` + "`up`" + ` return empty service lists, the server is older than the CLI. Run ` + "`pgpoolcli health`" + ` to compare versions.
@@ -73,9 +77,9 @@ Repo and worktree auto-detect from git. Override with ` + "`--repo`" + ` / ` + "
 const primeText = `pgpoolcli - per-worktree service management
 
 Each (repo, worktree) pair gets one ephemeral container per registered service.
-Today's services: postgres, seaweedfs. The server is stateless; all state lives
-in Docker labels and volumes. Auto-detection fills in repo and worktree from
-git when you do not pass them.
+Today's services: postgres, seaweedfs, fake-gcs. The server is stateless; all
+state lives in Docker labels and volumes. Auto-detection fills in repo and
+worktree from git when you do not pass them.
 
 Commands:
   pgpoolcli up [SERVICE...]
@@ -85,6 +89,11 @@ Commands:
   pgpoolcli down [SERVICE...]
     Destroy the listed services (or all configured services). NOT REVERSIBLE -
     volumes are gone.
+
+  pgpoolcli reload [SERVICE...]
+    Down-then-up the listed services. Equivalent to running down followed by
+    up. ALSO DESTROYS VOLUMES - data is gone. Use up (not reload) if you just
+    want to bring missing services back online.
 
   pgpoolcli status [SERVICE]
     Report state for every configured service in this worktree, or just the
@@ -141,6 +150,16 @@ Service catalog:
                Use the s3 endpoint with any S3 SDK; access keys are not
                enforced in the default configuration.
 
+  fake-gcs
+    image:     fsouza/fake-gcs-server:1.49
+    endpoints: storage (http, container 4443) - GCS-compatible JSON API
+    URL form:  http://HOST:HOSTPORT
+    notes:     Point Google Cloud Storage clients here via the
+               STORAGE_EMULATOR_HOST env var. The server pre-allocates the
+               host port and passes it as -external-url so download links
+               returned by the API are reachable. Auth is NOT enforced in
+               the default configuration.
+
 Typical flow inside a worktree:
   1. pgpoolcli up                # all services
   2. read connection URLs from each service's "endpoints" map
@@ -154,6 +173,8 @@ Troubleshooting:
     the server version and restart the server with the matching binary.
   - "container does not exist" from logs means up has not been run yet (or
     down has been run since).
+  - "404 Not Found" on pgpoolcli reload means the server is older than the
+    CLI. Upgrade the server.
 `
 
 // ---------- config ----------
