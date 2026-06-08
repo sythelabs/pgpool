@@ -4,11 +4,13 @@ Single-binary server that manages ephemeral per-worktree services on the host it
 
 ## Shape of the project
 
-- `pgpool.go` — entire program in `package main`. One file on purpose.
+- `cmd/pgpool/pgpool.go` — the server, entire program in `package main`. One file on purpose.
+- `cmd/pgpoolcli/pgpoolcli.go` — the thin client CLI, also one-file `package main`.
+- `internal/selfupdate/` — the only shared package: the `update` logic both binaries drive (reused because the published `install.sh` refreshes both binaries, so duplicating it in each `main` would let `installerURL`/env logic drift).
 - `go.mod` — stdlib only; no third-party deps.
-- Target: `go build` produces a single static binary named `pgpool`.
+- Target: `go build` produces static binaries named `pgpool` and `pgpoolcli`.
 
-Keep it a single file until there is a concrete reason not to. Do not split into packages speculatively.
+Keep each `main` a single file until there is a concrete reason not to. Do not split into packages speculatively — `internal/selfupdate` exists only because two binaries genuinely share it.
 
 ## Architecture
 
@@ -25,6 +27,8 @@ Keep it a single file until there is a concrete reason not to. Do not split into
 - Each (repo, worktree) can run multiple services. Service set per request is `services: [...]` in the body, or the server's `--services` default when absent.
 - Clients pass `repo` and `worktree` explicitly. The server never derives identity from `$PWD`.
 - Clients are responsible for their own `.env` file writing. The server only returns endpoint URLs.
+- The server stamps a single `--advertise-host` into every endpoint URL. That host may not resolve from a given client (e.g. a MagicDNS name when MagicDNS is off there). `pgpoolcli` defends against this: for any endpoint whose advertised host does not resolve locally, it rewrites the host to the control-plane host it reached the server on (the data-plane port is preserved) and notes it on stderr. Resolvable hosts are left untouched. See `rewriteEndpointHost` / `localizeEndpoints` in `pgpoolcli.go`.
+- `pgpoolcli update` / `pgpool update` self-update both binaries by re-running the published `install.sh` in the directory of the running binary (`internal/selfupdate`). The server's on-disk binary is replaced but the running daemon is not restarted — the command says so.
 
 ## Transports
 

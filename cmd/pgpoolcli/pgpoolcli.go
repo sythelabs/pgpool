@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,10 +24,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sythelabs/pgpool/internal/selfupdate"
 )
 
 const (
-	defaultURL = "http://localhost:8080"
+	defaultURL       = "http://localhost:8080"
 	defaultConfigRel = ".config/pgpool/pgpool.json"
 	// claudeBeginPrefix matches any version of the begin marker so init can
 	// replace older blocks (e.g. v:1, v:2) instead of stacking new ones beside them.
@@ -117,6 +120,12 @@ Commands:
   pgpoolcli init [--url URL] [--force]
     Write ~/.config/pgpool/pgpool.json and append the pgpool block to
     ./CLAUDE.md if not already present.
+
+  pgpoolcli update [--version TAG] [--dir DIR]
+    Self-update pgpool and pgpoolcli to the latest release (or --version TAG)
+    by re-running the published installer. Replaces both binaries in the
+    directory of the running CLI, or --dir. Restart the server afterward to
+    pick up the new server binary.
 
   pgpoolcli prime
     Print this text.
@@ -277,9 +286,10 @@ func gitOut(args ...string) (string, error) {
 }
 
 // repoFromRemote extracts the repo name from an origin URL.
-//   git@github.com:org/repo.git        -> repo
-//   https://github.com/org/repo        -> repo
-//   https://github.com/org/repo.git/   -> repo
+//
+//	git@github.com:org/repo.git        -> repo
+//	https://github.com/org/repo        -> repo
+//	https://github.com/org/repo.git/   -> repo
 func repoFromRemote(remote string) string {
 	s := strings.TrimSpace(remote)
 	s = strings.TrimSuffix(s, "/")
@@ -440,6 +450,100 @@ type runCtx struct {
 	jsonOnly bool
 	url      string
 	cfgPath  string
+	// resolve reports whether a hostname is resolvable from this machine.
+	// Injected for testability; nil falls back to hostResolves.
+	resolve func(string) bool
+}
+
+func (rc *runCtx) resolver() func(string) bool {
+	if rc.resolve != nil {
+		return rc.resolve
+	}
+	return hostResolves
+}
+
+// hostResolves reports whether host can be resolved to an address from this
+// machine. IP literals always resolve. This is the signal the CLI uses to
+// decide whether the server's advertised endpoint host is reachable here.
+func hostResolves(host string) bool {
+	if host == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	_, err := net.LookupHost(host)
+	return err == nil
+}
+
+// rewriteEndpointHost returns epURL with its host swapped to the control host
+// when the server-advertised host does not resolve from this machine.
+//
+// The server stamps its single --advertise-host into every endpoint URL it
+// returns. That host (often a MagicDNS / Tailscale name) may not resolve from
+// where the CLI runs, even though the control URL the CLI just spoke to does.
+// When the advertised host fails to resolve, substituting the control host
+// keeps the data plane reachable whenever control and data plane live on the
+// same machine. The data-plane port is preserved; only the host changes.
+//
+// resolves is injected for testability; pass hostResolves in production. The
+// returned advHost/ctrlHost are the original and substituted hosts (empty when
+// nothing changed) so callers can explain the rewrite to the operator.
+func rewriteEndpointHost(epURL, controlURL string, resolves func(string) bool) (out, advHost, ctrlHost string, changed bool) {
+	ep, err := url.Parse(epURL)
+	if err != nil || ep.Hostname() == "" {
+		return epURL, "", "", false
+	}
+	advertised := ep.Hostname()
+	if resolves(advertised) {
+		return epURL, "", "", false
+	}
+	ctrl, err := url.Parse(controlURL)
+	if err != nil || ctrl.Hostname() == "" {
+		return epURL, "", "", false
+	}
+	controlHost := ctrl.Hostname()
+	if controlHost == advertised {
+		return epURL, "", "", false
+	}
+	if port := ep.Port(); port != "" {
+		ep.Host = net.JoinHostPort(controlHost, port)
+	} else {
+		ep.Host = controlHost
+	}
+	return ep.String(), advertised, controlHost, true
+}
+
+// localizeEndpoints rewrites every endpoint URL in maps in place so that an
+// advertised host unreachable from this machine falls back to the control
+// host. A single note per substituted host is written to stderr so the
+// operator understands why the printed URLs differ from --advertise-host.
+func (rc *runCtx) localizeEndpoints(maps ...map[string]endpointJSON) {
+	resolves := rc.resolver()
+	rewrites := map[string]string{}
+	for _, m := range maps {
+		for role, ep := range m {
+			newURL, adv, ctrl, changed := rewriteEndpointHost(ep.URL, rc.url, resolves)
+			if changed {
+				rewrites[adv] = ctrl
+				ep.URL = newURL
+				m[role] = ep
+			}
+		}
+	}
+	for adv, ctrl := range rewrites {
+		fmt.Fprintf(os.Stderr, "note: advertised host %q is not resolvable here; using control host %q for endpoint URLs\n", adv, ctrl)
+	}
+}
+
+func serviceEndpointMaps(svcs []serviceResultJSON) []map[string]endpointJSON {
+	out := make([]map[string]endpointJSON, 0, len(svcs))
+	for _, s := range svcs {
+		if s.Endpoints != nil {
+			out = append(out, s.Endpoints)
+		}
+	}
+	return out
 }
 
 func cmdUp(rc *runCtx, repo, worktree string, services []string) error {
@@ -453,6 +557,7 @@ func cmdUp(rc *runCtx, repo, worktree string, services []string) error {
 	if err := rc.client.do(http.MethodPost, "/v1/up", body, &resp); err != nil {
 		return err
 	}
+	rc.localizeEndpoints(serviceEndpointMaps(resp.Services)...)
 	if rc.jsonOnly {
 		return printJSON(resp)
 	}
@@ -494,6 +599,7 @@ func cmdReload(rc *runCtx, repo, worktree string, services []string) error {
 	if err := rc.client.do(http.MethodPost, "/v1/reload", body, &resp); err != nil {
 		return err
 	}
+	rc.localizeEndpoints(serviceEndpointMaps(resp.Services)...)
 	if rc.jsonOnly {
 		return printJSON(resp)
 	}
@@ -518,6 +624,7 @@ func cmdStatus(rc *runCtx, repo, worktree, service string) error {
 	if err := rc.client.do(http.MethodGet, "/v1/status?"+q.Encode(), nil, &resp); err != nil {
 		return err
 	}
+	rc.localizeEndpoints(serviceEndpointMaps(resp.Services)...)
 	if rc.jsonOnly {
 		return printJSON(resp)
 	}
@@ -534,6 +641,13 @@ func cmdList(rc *runCtx) error {
 	if err := rc.client.do(http.MethodGet, "/v1/list", nil, &resp); err != nil {
 		return err
 	}
+	listMaps := make([]map[string]endpointJSON, 0, len(resp))
+	for _, row := range resp {
+		if row.Endpoints != nil {
+			listMaps = append(listMaps, row.Endpoints)
+		}
+	}
+	rc.localizeEndpoints(listMaps...)
 	if rc.jsonOnly {
 		return printJSON(resp)
 	}
@@ -755,6 +869,16 @@ func mergeClaudeBlock(existing []byte) ([]byte, claudeMergeAction, error) {
 	return b.Bytes(), claudeReplaced, nil
 }
 
+// ---------- self-update ----------
+
+func cmdUpdate(version, dir string, out io.Writer) error {
+	if err := selfupdate.Run(version, dir, selfupdate.ExecRun); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "update complete - pgpool and pgpoolcli replaced in place")
+	return nil
+}
+
 // ---------- interactive helpers ----------
 
 func readLine(br *bufio.Reader) (string, error) {
@@ -841,6 +965,7 @@ func newRunCtx(g globalFlags) (*runCtx, error) {
 		jsonOnly: g.jsonOnly,
 		url:      u,
 		cfgPath:  cfgPath,
+		resolve:  hostResolves,
 	}, nil
 }
 
@@ -860,6 +985,7 @@ Commands:
   health   Check that the server is reachable (also reports server version)
   config   Print the resolved config
   init     Write a config file and append a block to CLAUDE.md
+  update   Self-update pgpool and pgpoolcli to the latest release
   prime    Print the full workflow reference
 
 Global flags (all commands):
@@ -910,6 +1036,8 @@ func main() {
 		runConfig(args)
 	case "init":
 		runInit(args)
+	case "update":
+		runUpdate(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", cmd)
 		usage()
@@ -1076,6 +1204,14 @@ func runConfig(args []string) {
 	rc, err := newRunCtx(g)
 	fail(err)
 	fail(cmdConfig(rc))
+}
+
+func runUpdate(args []string) {
+	fs := flag.NewFlagSet("update", flag.ExitOnError)
+	version := fs.String("version", "", "release tag to install (default: latest)")
+	dir := fs.String("dir", "", "install directory (default: directory of the running binary)")
+	must(fs.Parse(args))
+	fail(cmdUpdate(*version, *dir, os.Stdout))
 }
 
 func runInit(args []string) {

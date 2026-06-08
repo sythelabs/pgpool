@@ -129,7 +129,28 @@ Config path resolution:
 pgpoolcli health      # liveness probe
 pgpoolcli config      # print resolved url + detected repo/worktree
 pgpoolcli prime       # full workflow reference (same text agents get)
+pgpoolcli update      # self-update both binaries to the latest release
 ```
+
+If the server advertises a host the client can't resolve (e.g. a MagicDNS /
+Tailscale name when MagicDNS isn't active here), the CLI automatically rewrites
+the endpoint URLs it prints to use the control-plane host you reached the server
+on, preserving the data-plane port. It prints a one-line note to stderr when it
+does this. Hosts that resolve are left untouched, so pure-tailnet addressing
+still works.
+
+## Keeping up to date
+
+```
+pgpoolcli update                  # latest release, both binaries
+pgpoolcli update --version v1.2.3 # pin a tag
+pgpool update                     # same, runnable from the server binary too
+```
+
+`update` re-runs the published installer, which replaces both `pgpool` and
+`pgpoolcli` in the directory of the running binary (override with `--dir`).
+Because it swaps the on-disk file, restart the running server afterward to pick
+up the new server binary.
 
 Pass `--json` to any command to get the raw server JSON instead of the
 human summary:

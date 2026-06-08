@@ -21,6 +21,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/sythelabs/pgpool/internal/selfupdate"
 )
 
 //go:embed index.html
@@ -94,8 +96,8 @@ type ServiceDef struct {
 	ContainerPrefix string
 	VolumePrefix    string
 	Image           string
-	DockerArgs      func(bc ServiceBuildCtx) []string                                            // flags placed BEFORE the image
-	DockerCommand   func(bc ServiceBuildCtx) []string                                            // args placed AFTER the image (container CMD)
+	DockerArgs      func(bc ServiceBuildCtx) []string // flags placed BEFORE the image
+	DockerCommand   func(bc ServiceBuildCtx) []string // args placed AFTER the image (container CMD)
 	Endpoints       []EndpointSpec
 	Readiness       func(ctx context.Context, s *Server, container string, bc ServiceBuildCtx) error
 	BuildURL        func(bc ServiceBuildCtx, role EndpointRole, hostPort string) string
@@ -1554,7 +1556,33 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
+// ---------- self-update ----------
+//
+// `pgpool update` reuses the shared selfupdate package, which drives the
+// published install.sh. That script installs both pgpool and pgpoolcli, so the
+// server refreshes its own on-disk binary (and the CLI alongside it). Replacing
+// the file does not restart the running daemon - the command says so.
+
+func runUpdate(args []string) {
+	fs := flag.NewFlagSet("update", flag.ExitOnError)
+	version := fs.String("version", "", "release tag to install (default: latest)")
+	dir := fs.String("dir", "", "install directory (default: directory of the running binary)")
+	if err := fs.Parse(args); err != nil {
+		log.Fatalf("pgpool: %v", err)
+	}
+	if err := selfupdate.Run(*version, *dir, selfupdate.ExecRun); err != nil {
+		log.Fatalf("pgpool update: %v", err)
+	}
+	fmt.Println("update complete - pgpool and pgpoolcli replaced in place")
+	fmt.Println("restart the running pgpool server to apply the new binary")
+}
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "update" {
+		runUpdate(os.Args[2:])
+		return
+	}
+
 	servicesCSV := getenv("PGPOOL_SERVICES", "postgres")
 
 	cfg := Config{
