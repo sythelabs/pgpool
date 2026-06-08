@@ -6,11 +6,90 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// TestRewriteEndpointHost_SwapsUnresolvableAdvertisedHost is the core of the
+// reachability fix: when the server advertises a host the client cannot
+// resolve, the CLI substitutes the control host (which it just reached) while
+// preserving the data-plane port, scheme, userinfo, and path.
+func TestRewriteEndpointHost_SwapsUnresolvableAdvertisedHost(t *testing.T) {
+	resolves := func(h string) bool { return h == "192.168.1.125" }
+	out, adv, ctrl, changed := rewriteEndpointHost(
+		"postgresql://u:p@pgpool.tail22511b.ts.net:54321/d",
+		"http://192.168.1.125:8080",
+		resolves,
+	)
+	if !changed {
+		t.Fatal("expected URL to be rewritten")
+	}
+	want := "postgresql://u:p@192.168.1.125:54321/d"
+	if out != want {
+		t.Errorf("rewritten URL = %q, want %q", out, want)
+	}
+	if adv != "pgpool.tail22511b.ts.net" || ctrl != "192.168.1.125" {
+		t.Errorf("adv/ctrl hosts = %q/%q, want pgpool.tail22511b.ts.net/192.168.1.125", adv, ctrl)
+	}
+}
+
+func TestRewriteEndpointHost_KeepsResolvableAdvertisedHost(t *testing.T) {
+	in := "http://pgpool.tail22511b.ts.net:18333"
+	out, _, _, changed := rewriteEndpointHost(in, "http://192.168.1.125:8080", func(string) bool { return true })
+	if changed || out != in {
+		t.Errorf("resolvable host should be left alone: out=%q changed=%v", out, changed)
+	}
+}
+
+func TestRewriteEndpointHost_NoopWhenHostsMatch(t *testing.T) {
+	in := "http://192.168.1.125:18333"
+	out, _, _, changed := rewriteEndpointHost(in, "http://192.168.1.125:8080", func(string) bool { return false })
+	if changed || out != in {
+		t.Errorf("no rewrite expected when ep host == control host: out=%q changed=%v", out, changed)
+	}
+}
+
+// TestCmdStatus_RewritesUnreachableAdvertisedHost exercises the whole path:
+// the server returns an endpoint URL whose advertised host does not resolve
+// here, and the printed output must use the control host instead.
+func TestCmdStatus_RewritesUnreachableAdvertisedHost(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"repo":"r","worktree":"w","services":[{"type":"postgres","container":"pg-r-w","volume":"pgvol-r-w","endpoints":{"primary":{"url":"postgresql://u:p@pgpool.tail22511b.ts.net:54321/d","host_port":"54321","container_port":5432}}}]}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	controlHost := mustHostname(t, srv.URL)
+	rc := &runCtx{
+		client:  newClient(srv.URL),
+		url:     srv.URL,
+		resolve: func(h string) bool { return h != "pgpool.tail22511b.ts.net" },
+	}
+	_, restore := captureStdout(t)
+	if err := cmdStatus(rc, "r", "w", ""); err != nil {
+		t.Fatalf("cmdStatus: %v", err)
+	}
+	out := restore()
+
+	if strings.Contains(out, "pgpool.tail22511b.ts.net") {
+		t.Errorf("unresolvable advertised host still printed:\n%s", out)
+	}
+	if !strings.Contains(out, controlHost+":54321/d") {
+		t.Errorf("expected control host %q with preserved port 54321 in output:\n%s", controlHost, out)
+	}
+}
+
+func mustHostname(t *testing.T, raw string) string {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse %q: %v", raw, err)
+	}
+	return u.Hostname()
+}
 
 // initTestEnv writes seedClaude (when non-empty) into a fresh tempdir, runs
 // cmdInit non-interactively against the server URL "http://example", and
