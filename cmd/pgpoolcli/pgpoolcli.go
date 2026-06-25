@@ -85,18 +85,21 @@ state lives in Docker labels and volumes. Auto-detection fills in repo and
 worktree from git when you do not pass them.
 
 Commands:
-  pgpoolcli up [SERVICE...]
+  pgpoolcli up [--image TAG] [SERVICE...]
     Bring up the listed services for this worktree, or all configured services
-    if no service is named. Idempotent. Returns one entry per service.
+    if no service is named. Idempotent. Returns one entry per service. --image
+    pins the postgres image tag (e.g. pgvector/pgvector:pg17) for this worktree;
+    other services ignore it. Put --image before any positional service names.
 
   pgpoolcli down [SERVICE...]
     Destroy the listed services (or all configured services). NOT REVERSIBLE -
     volumes are gone.
 
-  pgpoolcli reload [SERVICE...]
+  pgpoolcli reload [--image TAG] [SERVICE...]
     Down-then-up the listed services. Equivalent to running down followed by
     up. ALSO DESTROYS VOLUMES - data is gone. Use up (not reload) if you just
-    want to bring missing services back online.
+    want to bring missing services back online. --image works as it does for up;
+    pass it here too or the postgres pin reverts to the server default on reload.
 
   pgpoolcli status [SERVICE]
     Report state for every configured service in this worktree, or just the
@@ -141,7 +144,8 @@ Auto-detection:
 
 Service catalog:
   postgres
-    image:     postgres:17 (override per-call via the up "image" field)
+    image:     postgres:17 (override per-worktree with up/reload --image,
+               e.g. pgvector/pgvector:pg17)
     endpoints: primary  (postgresql, container port 5432)
     URL form:  postgresql://USER:PASS@HOST:HOSTPORT/DB
     notes:     User, password, and DB are server-configured (--pg-user,
@@ -546,10 +550,13 @@ func serviceEndpointMaps(svcs []serviceResultJSON) []map[string]endpointJSON {
 	return out
 }
 
-func cmdUp(rc *runCtx, repo, worktree string, services []string) error {
+func cmdUp(rc *runCtx, repo, worktree, image string, services []string) error {
 	body := map[string]any{"repo": repo, "worktree": worktree}
 	if len(services) > 0 {
 		body["services"] = services
+	}
+	if image != "" {
+		body["image"] = image
 	}
 	var resp struct {
 		Services []serviceResultJSON `json:"services"`
@@ -588,10 +595,13 @@ func cmdDown(rc *runCtx, repo, worktree string, services []string) error {
 	return nil
 }
 
-func cmdReload(rc *runCtx, repo, worktree string, services []string) error {
+func cmdReload(rc *runCtx, repo, worktree, image string, services []string) error {
 	body := map[string]any{"repo": repo, "worktree": worktree}
 	if len(services) > 0 {
 		body["services"] = services
+	}
+	if image != "" {
+		body["image"] = image
 	}
 	var resp struct {
 		Services []serviceResultJSON `json:"services"`
@@ -1051,6 +1061,7 @@ func runUp(args []string) {
 	addGlobalFlags(fs, &g)
 	repo := fs.String("repo", "", "repository name (defaults to git-detected)")
 	worktree := fs.String("worktree", "", "worktree name (defaults to $PWD basename)")
+	image := fs.String("image", "", "postgres image tag override (e.g. pgvector/pgvector:pg17); ignored by non-postgres services")
 	must(fs.Parse(args))
 
 	if *repo == "" {
@@ -1066,7 +1077,7 @@ func runUp(args []string) {
 
 	rc, err := newRunCtx(g)
 	fail(err)
-	fail(cmdUp(rc, r, w, fs.Args()))
+	fail(cmdUp(rc, r, w, *image, fs.Args()))
 }
 
 func runDown(args []string) {
@@ -1099,6 +1110,7 @@ func runReload(args []string) {
 	addGlobalFlags(fs, &g)
 	repo := fs.String("repo", "", "repository name (defaults to git-detected)")
 	worktree := fs.String("worktree", "", "worktree name (defaults to $PWD basename)")
+	image := fs.String("image", "", "postgres image tag override (e.g. pgvector/pgvector:pg17); ignored by non-postgres services")
 	must(fs.Parse(args))
 
 	if *repo == "" {
@@ -1114,7 +1126,7 @@ func runReload(args []string) {
 
 	rc, err := newRunCtx(g)
 	fail(err)
-	fail(cmdReload(rc, r, w, fs.Args()))
+	fail(cmdReload(rc, r, w, *image, fs.Args()))
 }
 
 func runStatus(args []string) {

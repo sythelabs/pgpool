@@ -195,7 +195,7 @@ func TestCmdReload_HTTPRoundTrip(t *testing.T) {
 
 	rc := &runCtx{client: newClient(srv.URL), url: srv.URL}
 	stdout, restore := captureStdout(t)
-	if err := cmdReload(rc, "r", "w", []string{"postgres"}); err != nil {
+	if err := cmdReload(rc, "r", "w", "", []string{"postgres"}); err != nil {
 		t.Fatalf("cmdReload: %v", err)
 	}
 	out := restore()
@@ -231,12 +231,94 @@ func TestCmdReload_SurfacesServerError(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	rc := &runCtx{client: newClient(srv.URL), url: srv.URL}
-	err := cmdReload(rc, "r", "w", []string{"nope"})
+	err := cmdReload(rc, "r", "w", "", []string{"nope"})
 	if err == nil {
 		t.Fatal("expected error for 400 response")
 	}
 	if !strings.Contains(err.Error(), "400") {
 		t.Errorf("error should mention 400: %v", err)
+	}
+}
+
+// TestCmdUp_SendsImageInBody asserts that a non-empty image is forwarded to the
+// server as the request body's "image" field, alongside repo/worktree/services.
+// This is the per-worktree image-pinning path (e.g. pgvector/pgvector:pg17).
+func TestCmdUp_SendsImageInBody(t *testing.T) {
+	var capturedPath string
+	var capturedBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"services":[{"type":"postgres","container":"pg-r-w","volume":"pgvol-r-w","reused":false}]}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	rc := &runCtx{client: newClient(srv.URL), url: srv.URL}
+	_, restore := captureStdout(t)
+	err := cmdUp(rc, "r", "w", "pgvector/pgvector:pg17", []string{"postgres"})
+	restore()
+	if err != nil {
+		t.Fatalf("cmdUp: %v", err)
+	}
+
+	if capturedPath != "/v1/up" {
+		t.Errorf("path = %q, want /v1/up", capturedPath)
+	}
+	if capturedBody["image"] != "pgvector/pgvector:pg17" {
+		t.Errorf("body.image = %v, want pgvector/pgvector:pg17", capturedBody["image"])
+	}
+	if capturedBody["repo"] != "r" || capturedBody["worktree"] != "w" {
+		t.Errorf("body missing repo/worktree: %+v", capturedBody)
+	}
+}
+
+// TestCmdUp_OmitsImageWhenEmpty asserts that an empty image leaves the "image"
+// field out of the body entirely, so the server falls back to its default.
+func TestCmdUp_OmitsImageWhenEmpty(t *testing.T) {
+	var capturedBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"services":[]}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	rc := &runCtx{client: newClient(srv.URL), url: srv.URL}
+	_, restore := captureStdout(t)
+	err := cmdUp(rc, "r", "w", "", nil)
+	restore()
+	if err != nil {
+		t.Fatalf("cmdUp: %v", err)
+	}
+	if _, present := capturedBody["image"]; present {
+		t.Errorf("body should omit image when empty, got %+v", capturedBody)
+	}
+}
+
+// TestCmdReload_SendsImageInBody mirrors the up path: reload recreates the
+// postgres container, so a pinned image must survive a reload too.
+func TestCmdReload_SendsImageInBody(t *testing.T) {
+	var capturedBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"services":[{"type":"postgres","container":"pg-r-w","volume":"pgvol-r-w","reused":false}]}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	rc := &runCtx{client: newClient(srv.URL), url: srv.URL}
+	_, restore := captureStdout(t)
+	err := cmdReload(rc, "r", "w", "pgvector/pgvector:pg17", []string{"postgres"})
+	restore()
+	if err != nil {
+		t.Fatalf("cmdReload: %v", err)
+	}
+	if capturedBody["image"] != "pgvector/pgvector:pg17" {
+		t.Errorf("body.image = %v, want pgvector/pgvector:pg17", capturedBody["image"])
 	}
 }
 

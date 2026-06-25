@@ -84,6 +84,7 @@ Inside a git worktree:
 ```
 pgpoolcli up                # bring up all configured services
 pgpoolcli up postgres       # bring up just postgres
+pgpoolcli up --image pgvector/pgvector:pg17 postgres  # pin the postgres image for this worktree
 pgpoolcli status            # show all services for this worktree
 pgpoolcli status seaweedfs  # filter to one service
 pgpoolcli logs              # tail logs for every service in this worktree
@@ -96,6 +97,11 @@ pgpoolcli down postgres     # tear down only postgres
 ```
 
 `logs` accepts `--tail N` (default 100, max 5000).
+
+`up` and `reload` accept `--image TAG` to override the postgres image for this
+worktree (e.g. `pgvector/pgvector:pg17`). Other services ignore it. Put the flag
+before any positional service names. Because `reload` recreates the container,
+pass `--image` there too or the pin reverts to the server default.
 
 `up` is per-service idempotent. `down` destroys volumes - data is gone.
 
