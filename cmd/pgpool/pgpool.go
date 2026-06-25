@@ -112,7 +112,12 @@ var postgresDef = ServiceDef{
 	Image:           "postgres:17",
 	DockerArgs: func(bc ServiceBuildCtx) []string {
 		return []string{
-			"-v", bc.Volume + ":/var/lib/postgresql/data",
+			// Mount at /var/lib/postgresql (the parent), not .../data. Postgres
+			// 18+ images relocated PGDATA to a major-version subdir and refuse to
+			// boot when the volume is mounted at the legacy .../data path; older
+			// tags keep their data under this same parent, so this is correct for
+			// every supported image.
+			"-v", bc.Volume + ":/var/lib/postgresql",
 			"-e", "POSTGRES_PASSWORD=" + bc.Cfg.PgPassword,
 			"-e", "POSTGRES_USER=" + bc.Cfg.PgUser,
 			"-e", "POSTGRES_DB=" + bc.Cfg.PgDB,

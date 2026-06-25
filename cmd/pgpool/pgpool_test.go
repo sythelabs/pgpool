@@ -389,6 +389,32 @@ func TestFakeGCS_RegisteredWithExpectedShape(t *testing.T) {
 	}
 }
 
+// TestPostgres_MountsVolumeAtParent guards the postgres data-volume mount path.
+// Official postgres 18+ images relocated PGDATA into a major-version subdir and
+// require the volume mounted at /var/lib/postgresql (the parent); mounting at the
+// legacy /var/lib/postgresql/data makes the image refuse to boot (exit 1) before
+// Postgres logs anything, which surfaces as a readiness timeout. Earlier tags
+// (e.g. pg17) keep their data under that same parent, so the parent mount is
+// correct for every supported image.
+func TestPostgres_MountsVolumeAtParent(t *testing.T) {
+	def, ok := serviceDefs["postgres"]
+	if !ok {
+		t.Fatal("postgres not registered")
+	}
+	bc := ServiceBuildCtx{
+		Cfg:    Config{PgUser: "u", PgPassword: "p", PgDB: "d"},
+		Volume: "pgvol-x-y",
+		Image:  def.Image,
+	}
+	args := def.DockerArgs(bc)
+	if !containsAdjacent(args, "-v", "pgvol-x-y:/var/lib/postgresql") {
+		t.Errorf("DockerArgs missing -v %q in %v", "pgvol-x-y:/var/lib/postgresql", args)
+	}
+	if containsAdjacent(args, "-v", "pgvol-x-y:/var/lib/postgresql/data") {
+		t.Errorf("DockerArgs mounts at legacy /var/lib/postgresql/data, which breaks postgres 18+: %v", args)
+	}
+}
+
 // containsAdjacent reports whether args contains flag followed immediately by value.
 func containsAdjacent(args []string, flag, value string) bool {
 	for i := 0; i < len(args)-1; i++ {
