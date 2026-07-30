@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -370,6 +372,184 @@ func TestReserveHostPorts_ReleasesListeners(t *testing.T) {
 		t.Fatalf("reserved port %s could not be rebound: %v", port, err)
 	}
 	_ = l.Close()
+}
+
+func TestHandleHTMX_ServesPinnedLocalAsset(t *testing.T) {
+	s := &Server{}
+	rr := httptest.NewRecorder()
+	s.handleHTMX(rr, httptest.NewRequest(http.MethodGet, "/assets/htmx-2.0.10.min.js", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if got := rr.Header().Get("Content-Type"); !strings.Contains(got, "application/javascript") {
+		t.Errorf("Content-Type = %q, want JavaScript", got)
+	}
+	if !strings.Contains(rr.Body.String(), "htmx") {
+		t.Error("asset body does not contain htmx")
+	}
+}
+
+func TestHandleUIDashboard_RendersLifecycleTable(t *testing.T) {
+	s := &Server{
+		cfg: Config{
+			AdvertiseHost: "host.example",
+			PgUser:        "postgres",
+			PgPassword:    "password",
+			PgDB:          "postgres",
+		},
+		docker: newFakeDockerUI(t, "repo", "worktree"),
+	}
+	rr := httptest.NewRecorder()
+	s.handleUIDashboard(rr, httptest.NewRequest(http.MethodGet, "/ui/dashboard", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	for _, want := range []string{
+		"repo", "worktree", "postgresql://postgres:password@host.example:54321/postgres",
+		"Status", "Logs", "Reload", "Down", `hx-post="/ui/down"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("dashboard missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, `{"type":`) {
+		t.Errorf("dashboard rendered raw JSON: %s", body)
+	}
+}
+
+func TestHandleUIUp_UsesFormImageAndReturnsDashboard(t *testing.T) {
+	s := &Server{
+		cfg: Config{
+			AdvertiseHost:   "host.example",
+			PgUser:          "postgres",
+			PgPassword:      "password",
+			PgDB:            "postgres",
+			PgImage:         defaultPostgresImage,
+			DefaultServices: []string{"postgres"},
+		},
+		docker: newFakeDockerUI(t, "repo", "worktree"),
+	}
+	form := strings.NewReader("repo=repo&worktree=worktree&services=postgres&image=pgvector%2Fpgvector%3Apg18-bookworm")
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/ui/up", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.handleUIUp(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "Started repo/worktree") {
+		t.Errorf("missing success notice: %s", body)
+	}
+	if !strings.Contains(body, "pgvector/pgvector:pg18-bookworm") {
+		t.Errorf("missing selected image from lifecycle result: %s", body)
+	}
+}
+
+func TestHandleUIStatus_RendersServiceDetail(t *testing.T) {
+	s := &Server{
+		cfg: Config{
+			AdvertiseHost: "host.example",
+			PgUser:        "postgres",
+			PgPassword:    "password",
+			PgDB:          "postgres",
+		},
+		docker: newFakeDockerUIDetails(t),
+	}
+	rr := httptest.NewRecorder()
+	s.handleUIStatus(rr, httptest.NewRequest(http.MethodGet, "/ui/status?repo=repo&worktree=worktree&service=postgres", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "postgres status: running") || !strings.Contains(body, "postgresql://postgres:password@host.example:54321/postgres") {
+		t.Errorf("unexpected status detail: %s", body)
+	}
+}
+
+func TestHandleUILogs_EscapesLogOutput(t *testing.T) {
+	s := &Server{cfg: Config{DefaultServices: []string{"postgres"}}, docker: newFakeDockerUIDetails(t)}
+	rr := httptest.NewRecorder()
+	s.handleUILogs(rr, httptest.NewRequest(http.MethodGet, "/ui/logs?repo=repo&worktree=worktree&service=postgres", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, "<script>alert(1)</script>") {
+		t.Errorf("logs emitted executable markup: %s", body)
+	}
+	if !strings.Contains(body, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+		t.Errorf("logs were not escaped: %s", body)
+	}
+}
+
+func TestHandleUIDashboard_EscapesDockerLabels(t *testing.T) {
+	const payload = "<script>alert(1)</script>"
+	s := &Server{
+		cfg:    Config{AdvertiseHost: "host.example"},
+		docker: newFakeDockerUI(t, payload, "worktree"),
+	}
+	rr := httptest.NewRecorder()
+	s.handleUIDashboard(rr, httptest.NewRequest(http.MethodGet, "/ui/dashboard", nil))
+
+	body := rr.Body.String()
+	if strings.Contains(body, payload) {
+		t.Errorf("dashboard emitted executable label: %s", body)
+	}
+	if !strings.Contains(body, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+		t.Errorf("dashboard did not escape label: %s", body)
+	}
+}
+
+func newFakeDockerUI(t *testing.T, repo, worktree string) dockerExec {
+	t.Helper()
+	return func(_ context.Context, args ...string) (string, string, error) {
+		switch args[0] {
+		case "ps":
+			row, err := json.Marshal(dockerPSRow{
+				Names:     "pg-repo-worktree",
+				Labels:    "pgpool=true,pgpool.repo=" + repo + ",pgpool.worktree=" + worktree + ",pgpool.service=postgres",
+				State:     "running",
+				CreatedAt: "2026-07-30 12:00:00 +0000 UTC",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(row) + "\n", "", nil
+		case "inspect":
+			return "", "Error: No such object", errors.New("exit 1")
+		case "volume", "run", "exec", "rm":
+			return "container-id\n", "", nil
+		case "port":
+			return "0.0.0.0:54321\n", "", nil
+		default:
+			t.Fatalf("unexpected docker command: %v", args)
+			return "", "", nil
+		}
+	}
+}
+
+func newFakeDockerUIDetails(t *testing.T) dockerExec {
+	t.Helper()
+	return func(_ context.Context, args ...string) (string, string, error) {
+		switch args[0] {
+		case "inspect":
+			return `[{"Id":"container-id","Created":"2026-07-30T12:00:00Z","State":{"Status":"running","Running":true}}]`, "", nil
+		case "port":
+			return "0.0.0.0:54321\n", "", nil
+		case "logs":
+			return "server <script>alert(1)</script>\n", "", nil
+		default:
+			t.Fatalf("unexpected docker command: %v", args)
+			return "", "", nil
+		}
+	}
 }
 
 func TestFakeGCS_RegisteredWithExpectedShape(t *testing.T) {

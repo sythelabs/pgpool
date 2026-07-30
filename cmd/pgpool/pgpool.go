@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	_ "embed"
@@ -9,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html/template"
 	"log"
 	"net"
 	"net/http"
@@ -17,6 +19,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -27,6 +30,9 @@ import (
 
 //go:embed index.html
 var indexHTML []byte
+
+//go:embed htmx-2.0.10.min.js
+var htmxJS []byte
 
 const (
 	mcpProtocolVersion = "2025-06-18"
@@ -1298,6 +1304,303 @@ func requestLogger(next http.Handler) http.Handler {
 	})
 }
 
+type uiNotice struct {
+	Kind    string
+	Message string
+}
+
+type uiWorktree struct {
+	Repo     string
+	Worktree string
+	Services []ListedContainer
+}
+
+type uiDashboardData struct {
+	Notice    uiNotice
+	Worktrees []uiWorktree
+}
+
+type uiEndpoint struct {
+	Role EndpointRole
+	URL  string
+}
+
+var uiTemplates = template.Must(template.New("dashboard").Funcs(template.FuncMap{
+	"detailID":     uiDetailID,
+	"endpoints":    sortedUIEndpoints,
+	"httpEndpoint": isHTTPEndpoint,
+}).Parse(`{{define "dashboard"}}
+<main id="dashboard" hx-get="/ui/dashboard" hx-trigger="every 15s" hx-swap="outerHTML" aria-live="polite">
+  <section class="card">
+    {{if .Notice.Message}}<p class="notice {{.Notice.Kind}}" role="alert">{{.Notice.Message}}</p>{{end}}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Worktree</th><th>Service</th><th>State</th><th>Endpoints</th><th>Actions</th></tr></thead>
+        <tbody>
+          {{if .Worktrees}}
+            {{range $worktree := .Worktrees}}
+              {{range .Services}}
+                <tr>
+                  <td><span class="worktree">{{$worktree.Repo}}</span><br><span class="muted">{{$worktree.Worktree}}</span></td>
+                  <td><span class="service">{{.Type}}</span><br><span class="muted">{{.Container}}</span></td>
+                  <td><span class="state {{.State}}">{{.State}}</span></td>
+                  <td><div class="endpoints">{{range endpoints .Endpoints}}{{if httpEndpoint .URL}}<a href="{{.URL}}" target="_blank" rel="noreferrer">{{.Role}}: {{.URL}}</a>{{else}}<span>{{.Role}}: {{.URL}}</span>{{end}}{{else}}<span class="muted">No published endpoints</span>{{end}}</div></td>
+                  <td><div class="actions">
+                    <form action="/ui/status" method="get" hx-get="/ui/status" hx-target="#{{detailID $worktree.Repo $worktree.Worktree .Type}}" hx-swap="innerHTML">
+                      <input type="hidden" name="repo" value="{{$worktree.Repo}}"><input type="hidden" name="worktree" value="{{$worktree.Worktree}}"><input type="hidden" name="service" value="{{.Type}}"><button class="secondary" type="submit">Status</button>
+                    </form>
+                    <form action="/ui/logs" method="get" hx-get="/ui/logs" hx-target="#{{detailID $worktree.Repo $worktree.Worktree .Type}}" hx-swap="innerHTML">
+                      <input type="hidden" name="repo" value="{{$worktree.Repo}}"><input type="hidden" name="worktree" value="{{$worktree.Worktree}}"><input type="hidden" name="service" value="{{.Type}}"><button class="secondary" type="submit">Logs</button>
+                    </form>
+                    <form action="/ui/reload" method="post" hx-post="/ui/reload" hx-target="#dashboard" hx-swap="outerHTML" hx-confirm="This destroys the service volume. Continue?">
+                      <input type="hidden" name="repo" value="{{$worktree.Repo}}"><input type="hidden" name="worktree" value="{{$worktree.Worktree}}"><input type="hidden" name="services" value="{{.Type}}"><button class="secondary" type="submit">Reload</button>
+                    </form>
+                    <form action="/ui/down" method="post" hx-post="/ui/down" hx-target="#dashboard" hx-swap="outerHTML" hx-confirm="This destroys the service volume. Continue?">
+                      <input type="hidden" name="repo" value="{{$worktree.Repo}}"><input type="hidden" name="worktree" value="{{$worktree.Worktree}}"><input type="hidden" name="services" value="{{.Type}}"><button class="danger" type="submit">Down</button>
+                    </form>
+                  </div></td>
+                </tr>
+                <tr id="{{detailID $worktree.Repo $worktree.Worktree .Type}}" class="details"></tr>
+              {{end}}
+            {{end}}
+          {{else}}
+            <tr><td class="empty" colspan="5">No managed worktrees.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+{{end}}
+{{define "status"}}
+{{range .Services}}<td colspan="5"><strong>{{.Type}} status: {{.State}}</strong><div class="endpoints">{{range endpoints .Endpoints}}{{if httpEndpoint .URL}}<a href="{{.URL}}" target="_blank" rel="noreferrer">{{.Role}}: {{.URL}}</a>{{else}}<span>{{.Role}}: {{.URL}}</span>{{end}}{{else}}<span class="muted">No published endpoints</span>{{end}}</div></td>{{end}}
+{{end}}
+{{define "logs"}}
+{{range .Services}}<td colspan="5"><strong>{{.Type}} logs (tail {{$.Tail}})</strong><pre>{{if .Logs}}{{.Logs}}{{else}}No logs available for {{.State}} service.{{end}}</pre></td>{{end}}
+{{end}}
+{{define "error"}}<main id="dashboard" hx-get="/ui/dashboard" hx-trigger="every 15s" hx-swap="outerHTML"><section class="card"><p class="notice error" role="alert">{{.}}</p></section></main>{{end}}
+{{define "detail-error"}}<td colspan="5"><p class="notice error" role="alert">{{.}}</p></td>{{end}}`))
+
+func sortedUIEndpoints(endpoints map[EndpointRole]EndpointInfo) []uiEndpoint {
+	out := make([]uiEndpoint, 0, len(endpoints))
+	for role, endpoint := range endpoints {
+		out = append(out, uiEndpoint{Role: role, URL: endpoint.URL})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Role < out[j].Role })
+	return out
+}
+
+func isHTTPEndpoint(raw string) bool {
+	return strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://")
+}
+
+func uiDetailID(repo, worktree, service string) string {
+	sum := sha256.Sum256([]byte(repo + "\x00" + worktree + "\x00" + service))
+	return "detail-" + hex.EncodeToString(sum[:8])
+}
+
+func executeUITemplate(name string, data any) ([]byte, error) {
+	var out bytes.Buffer
+	if err := uiTemplates.ExecuteTemplate(&out, name, data); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+func (s *Server) renderDashboard(ctx context.Context, notice uiNotice) ([]byte, error) {
+	items, err := s.listContainers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Repo != items[j].Repo {
+			return items[i].Repo < items[j].Repo
+		}
+		if items[i].Worktree != items[j].Worktree {
+			return items[i].Worktree < items[j].Worktree
+		}
+		return items[i].Type < items[j].Type
+	})
+	data := uiDashboardData{Notice: notice}
+	for _, item := range items {
+		if len(data.Worktrees) == 0 || data.Worktrees[len(data.Worktrees)-1].Repo != item.Repo || data.Worktrees[len(data.Worktrees)-1].Worktree != item.Worktree {
+			data.Worktrees = append(data.Worktrees, uiWorktree{Repo: item.Repo, Worktree: item.Worktree})
+		}
+		last := len(data.Worktrees) - 1
+		data.Worktrees[last].Services = append(data.Worktrees[last].Services, item)
+	}
+	return executeUITemplate("dashboard", data)
+}
+
+func writeUIHTML(w http.ResponseWriter, status int, body []byte) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+func writeUIError(w http.ResponseWriter, status int, err error) {
+	body, templateErr := executeUITemplate("error", err.Error())
+	if templateErr != nil {
+		http.Error(w, "render UI error: "+templateErr.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeUIHTML(w, status, body)
+}
+
+func writeUIDetailError(w http.ResponseWriter, status int, err error) {
+	body, templateErr := executeUITemplate("detail-error", err.Error())
+	if templateErr != nil {
+		http.Error(w, "render UI error: "+templateErr.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeUIHTML(w, status, body)
+}
+
+func (s *Server) writeDashboard(w http.ResponseWriter, r *http.Request, notice uiNotice) {
+	body, err := s.renderDashboard(r.Context(), notice)
+	if err != nil {
+		writeUIError(w, http.StatusInternalServerError, fmt.Errorf("load managed worktrees: %w", err))
+		return
+	}
+	writeUIHTML(w, http.StatusOK, body)
+}
+
+func uiRequestFromForm(r *http.Request) (repo, worktree, image string, services []string, err error) {
+	if err := r.ParseForm(); err != nil {
+		return "", "", "", nil, fmt.Errorf("parse form: %w", err)
+	}
+	repo = strings.TrimSpace(r.FormValue("repo"))
+	worktree = strings.TrimSpace(r.FormValue("worktree"))
+	image = strings.TrimSpace(r.FormValue("image"))
+	if repo == "" || worktree == "" {
+		return "", "", "", nil, errors.New("repo and worktree are required")
+	}
+	for _, value := range r.Form["services"] {
+		services = append(services, parseServicesCSV(value)...)
+	}
+	return repo, worktree, image, services, nil
+}
+
+func uiQueryIdentity(r *http.Request) (repo, worktree, service string, err error) {
+	repo = strings.TrimSpace(r.URL.Query().Get("repo"))
+	worktree = strings.TrimSpace(r.URL.Query().Get("worktree"))
+	service = strings.TrimSpace(r.URL.Query().Get("service"))
+	if repo == "" || worktree == "" || service == "" {
+		return "", "", "", errors.New("repo, worktree, and service are required")
+	}
+	return repo, worktree, service, nil
+}
+
+func (s *Server) handleHTMX(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	_, _ = w.Write(htmxJS)
+}
+
+func (s *Server) handleUIDashboard(w http.ResponseWriter, r *http.Request) {
+	s.writeDashboard(w, r, uiNotice{})
+}
+
+func (s *Server) handleUIUp(w http.ResponseWriter, r *http.Request) {
+	repo, worktree, image, services, err := uiRequestFromForm(r)
+	if err != nil {
+		writeUIError(w, http.StatusBadRequest, err)
+		return
+	}
+	_, err = s.opUp(r.Context(), UpRequest{Repo: repo, Worktree: worktree, Services: services, Image: image})
+	if err != nil {
+		s.writeDashboard(w, r, uiNotice{Kind: "error", Message: err.Error()})
+		return
+	}
+	message := fmt.Sprintf("Started %s/%s", repo, worktree)
+	if image != "" {
+		message += " using " + image
+	}
+	s.writeDashboard(w, r, uiNotice{Kind: "success", Message: message})
+}
+
+func (s *Server) handleUIDown(w http.ResponseWriter, r *http.Request) {
+	repo, worktree, _, services, err := uiRequestFromForm(r)
+	if err != nil {
+		writeUIError(w, http.StatusBadRequest, err)
+		return
+	}
+	_, err = s.opDown(r.Context(), DownRequest{Repo: repo, Worktree: worktree, Services: services})
+	if err != nil {
+		s.writeDashboard(w, r, uiNotice{Kind: "error", Message: err.Error()})
+		return
+	}
+	s.writeDashboard(w, r, uiNotice{Kind: "success", Message: fmt.Sprintf("Stopped and removed %s/%s", repo, worktree)})
+}
+
+func (s *Server) handleUIReload(w http.ResponseWriter, r *http.Request) {
+	repo, worktree, image, services, err := uiRequestFromForm(r)
+	if err != nil {
+		writeUIError(w, http.StatusBadRequest, err)
+		return
+	}
+	_, err = s.opReload(r.Context(), ReloadRequest{Repo: repo, Worktree: worktree, Services: services, Image: image})
+	if err != nil {
+		s.writeDashboard(w, r, uiNotice{Kind: "error", Message: err.Error()})
+		return
+	}
+	message := fmt.Sprintf("Reloaded %s/%s", repo, worktree)
+	if image != "" {
+		message += " using " + image
+	}
+	s.writeDashboard(w, r, uiNotice{Kind: "success", Message: message})
+}
+
+func (s *Server) handleUIStatus(w http.ResponseWriter, r *http.Request) {
+	repo, worktree, service, err := uiQueryIdentity(r)
+	if err != nil {
+		writeUIDetailError(w, http.StatusBadRequest, err)
+		return
+	}
+	response, err := s.opStatus(r.Context(), repo, worktree, service)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errUnknownService) {
+			status = http.StatusBadRequest
+		}
+		writeUIDetailError(w, status, err)
+		return
+	}
+	body, err := executeUITemplate("status", response)
+	if err != nil {
+		writeUIDetailError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeUIHTML(w, http.StatusOK, body)
+}
+
+func (s *Server) handleUILogs(w http.ResponseWriter, r *http.Request) {
+	repo, worktree, service, err := uiQueryIdentity(r)
+	if err != nil {
+		writeUIDetailError(w, http.StatusBadRequest, err)
+		return
+	}
+	tail, err := parseTailParam(r.URL.Query().Get("tail"))
+	if err != nil {
+		writeUIDetailError(w, http.StatusBadRequest, err)
+		return
+	}
+	response, err := s.opLogs(r.Context(), repo, worktree, service, tail)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errUnknownService) {
+			status = http.StatusBadRequest
+		}
+		writeUIDetailError(w, status, err)
+		return
+	}
+	body, err := executeUITemplate("logs", response)
+	if err != nil {
+		writeUIDetailError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeUIHTML(w, http.StatusOK, body)
+}
+
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -1646,6 +1949,13 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleIndex)
+	mux.HandleFunc("GET /assets/htmx-2.0.10.min.js", srv.handleHTMX)
+	mux.HandleFunc("GET /ui/dashboard", srv.handleUIDashboard)
+	mux.HandleFunc("POST /ui/up", srv.handleUIUp)
+	mux.HandleFunc("POST /ui/down", srv.handleUIDown)
+	mux.HandleFunc("POST /ui/reload", srv.handleUIReload)
+	mux.HandleFunc("GET /ui/status", srv.handleUIStatus)
+	mux.HandleFunc("GET /ui/logs", srv.handleUILogs)
 	mux.HandleFunc("GET /healthz", srv.handleHealth)
 	mux.HandleFunc("POST /v1/up", srv.handleUp)
 	mux.HandleFunc("POST /v1/down", srv.handleDown)
