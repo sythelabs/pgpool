@@ -105,11 +105,16 @@ type ServiceDef struct {
 
 var serviceDefs = map[string]ServiceDef{}
 
+const (
+	defaultPostgresImage  = "pgvector/pgvector:pg18"
+	defaultSeaweedfsImage = "chrislusf/seaweedfs:4.40"
+)
+
 var postgresDef = ServiceDef{
 	Type:            "postgres",
 	ContainerPrefix: "pg",
 	VolumePrefix:    "pgvol",
-	Image:           "postgres:17",
+	Image:           defaultPostgresImage,
 	DockerArgs: func(bc ServiceBuildCtx) []string {
 		return []string{
 			// Mount at /var/lib/postgresql (the parent), not .../data. Postgres
@@ -148,7 +153,7 @@ var seaweedfsDef = ServiceDef{
 	Type:            "seaweedfs",
 	ContainerPrefix: "weed",
 	VolumePrefix:    "weedvol",
-	Image:           "chrislusf/seaweedfs:3.71",
+	Image:           defaultSeaweedfsImage,
 	DockerArgs: func(bc ServiceBuildCtx) []string {
 		return []string{"-v", bc.Volume + ":/data"}
 	},
@@ -888,6 +893,19 @@ func (s *Server) resolveServices(requested []string) ([]ServiceDef, error) {
 	return out, nil
 }
 
+func (s *Server) imageFor(def ServiceDef, override string) string {
+	if def.Type != "postgres" {
+		return def.Image
+	}
+	if override != "" {
+		return override
+	}
+	if s.cfg.PgImage != "" {
+		return s.cfg.PgImage
+	}
+	return def.Image
+}
+
 func (s *Server) opUp(ctx context.Context, req UpRequest) (*UpResponse, error) {
 	defs, err := s.resolveServices(req.Services)
 	if err != nil {
@@ -895,11 +913,7 @@ func (s *Server) opUp(ctx context.Context, req UpRequest) (*UpResponse, error) {
 	}
 	results := make([]ServiceResult, 0, len(defs))
 	for _, def := range defs {
-		image := ""
-		if def.Type == "postgres" {
-			image = req.Image
-		}
-		res, err := s.serviceUp(ctx, def, req.Repo, req.Worktree, image)
+		res, err := s.serviceUp(ctx, def, req.Repo, req.Worktree, s.imageFor(def, req.Image))
 		if err != nil {
 			return &UpResponse{Services: results}, err
 		}
@@ -948,11 +962,7 @@ func (s *Server) opReload(ctx context.Context, req ReloadRequest) (*ReloadRespon
 				Failed:   &ServiceFailure{Type: def.Type, Phase: reloadPhaseDown, Err: downErr.Error()},
 			}, wrapped
 		}
-		image := ""
-		if def.Type == "postgres" {
-			image = req.Image
-		}
-		res, upErr := s.serviceUp(ctx, def, req.Repo, req.Worktree, image)
+		res, upErr := s.serviceUp(ctx, def, req.Repo, req.Worktree, s.imageFor(def, req.Image))
 		if upErr != nil {
 			// serviceDown succeeded - the volume is gone. Surface that as a
 			// State="destroyed" entry so callers see which service was wiped
@@ -1593,7 +1603,7 @@ func main() {
 	cfg := Config{
 		ListenAddr:     getenv("PGPOOL_LISTEN", ":8080"),
 		AdvertiseHost:  getenv("PGPOOL_ADVERTISE_HOST", "localhost"),
-		PgImage:        getenv("PGPOOL_IMAGE", "postgres:17"),
+		PgImage:        getenv("PGPOOL_IMAGE", defaultPostgresImage),
 		PgUser:         getenv("PGPOOL_PG_USER", "postgres"),
 		PgPassword:     os.Getenv("PGPOOL_PG_PASSWORD"),
 		PgDB:           getenv("PGPOOL_PG_DB", "postgres"),

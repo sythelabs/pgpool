@@ -78,7 +78,7 @@ Flags (or equivalent env vars). `--pg-password` is the only required field:
 | `--listen`         | `PGPOOL_LISTEN`         | `:8080`       |
 | `--services`       | `PGPOOL_SERVICES`       | `postgres`    |
 | `--advertise-host` | `PGPOOL_ADVERTISE_HOST` | `localhost`   |
-| `--image`          | `PGPOOL_IMAGE`          | `postgres:17` |
+| `--image`          | `PGPOOL_IMAGE`          | `pgvector/pgvector:pg18` |
 | `--pg-user`        | `PGPOOL_PG_USER`        | `postgres`    |
 | `--pg-password`    | `PGPOOL_PG_PASSWORD`    | *(required)*  |
 | `--pg-db`          | `PGPOOL_PG_DB`          | `postgres`    |

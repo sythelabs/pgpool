@@ -88,7 +88,7 @@ Commands:
   pgpoolcli up [--image TAG] [SERVICE...]
     Bring up the listed services for this worktree, or all configured services
     if no service is named. Idempotent. Returns one entry per service. --image
-    pins the postgres image tag (e.g. pgvector/pgvector:pg17) for this worktree;
+    pins the postgres image tag (e.g. pgvector/pgvector:pg18) for this worktree;
     other services ignore it. Put --image before any positional service names.
 
   pgpoolcli down [SERVICE...]
@@ -144,8 +144,8 @@ Auto-detection:
 
 Service catalog:
   postgres
-    image:     postgres:17 (override per-worktree with up/reload --image,
-               e.g. pgvector/pgvector:pg17)
+    image:     pgvector/pgvector:pg18 (override per-worktree with up/reload --image,
+               e.g. pgvector/pgvector:pg18)
     endpoints: primary  (postgresql, container port 5432)
     URL form:  postgresql://USER:PASS@HOST:HOSTPORT/DB
     notes:     User, password, and DB are server-configured (--pg-user,
@@ -153,7 +153,7 @@ Service catalog:
                responses; the server does not write a .env for you.
 
   seaweedfs
-    image:     chrislusf/seaweedfs:3.71
+    image:     chrislusf/seaweedfs:4.40
     endpoints: master  (http, container 9333) - cluster control plane
                volume  (http, container 8080) - chunk storage
                filer   (http, container 8888) - filesystem API
@@ -1061,7 +1061,7 @@ func runUp(args []string) {
 	addGlobalFlags(fs, &g)
 	repo := fs.String("repo", "", "repository name (defaults to git-detected)")
 	worktree := fs.String("worktree", "", "worktree name (defaults to $PWD basename)")
-	image := fs.String("image", "", "postgres image tag override (e.g. pgvector/pgvector:pg17); ignored by non-postgres services")
+	image := fs.String("image", "", "postgres image tag override (e.g. pgvector/pgvector:pg18); ignored by non-postgres services")
 	must(fs.Parse(args))
 
 	if *repo == "" {
@@ -1110,7 +1110,7 @@ func runReload(args []string) {
 	addGlobalFlags(fs, &g)
 	repo := fs.String("repo", "", "repository name (defaults to git-detected)")
 	worktree := fs.String("worktree", "", "worktree name (defaults to $PWD basename)")
-	image := fs.String("image", "", "postgres image tag override (e.g. pgvector/pgvector:pg17); ignored by non-postgres services")
+	image := fs.String("image", "", "postgres image tag override (e.g. pgvector/pgvector:pg18); ignored by non-postgres services")
 	must(fs.Parse(args))
 
 	if *repo == "" {

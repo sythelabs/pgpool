@@ -28,6 +28,7 @@ func newTestServer(t *testing.T, services []string) *Server {
 		PgUser:          "postgres",
 		PgPassword:      "test-password-do-not-reuse",
 		PgDB:            "postgres",
+		PgImage:         defaultPostgresImage,
 		DockerBin:       "docker",
 		StartupTimeout:  90 * time.Second,
 		DefaultServices: services,
@@ -58,6 +59,17 @@ func TestIntegration_PostgresLifecycle(t *testing.T) {
 	if len(st.Services) != 1 || st.Services[0].State != "running" {
 		t.Fatalf("status not running: %+v", st)
 	}
+
+	out, errOut, err := s.runDocker(ctx, "exec", up.Services[0].Container,
+		"psql", "-v", "ON_ERROR_STOP=1", "-U", s.cfg.PgUser, "-d", s.cfg.PgDB,
+		"-c", "CREATE EXTENSION IF NOT EXISTS vector; SELECT 1 FROM pg_extension WHERE extname = 'vector';",
+	)
+	if err != nil {
+		t.Fatalf("create vector extension: %v: %s", err, errOut)
+	}
+	if !strings.Contains(out, "1") {
+		t.Fatalf("vector extension was not listed: %q", out)
+	}
 }
 
 func TestIntegration_SeaweedfsLifecycle(t *testing.T) {
@@ -71,6 +83,13 @@ func TestIntegration_SeaweedfsLifecycle(t *testing.T) {
 	}
 	if len(up.Services) != 1 || up.Services[0].Type != "seaweedfs" {
 		t.Fatalf("unexpected up response: %+v", up)
+	}
+	image, errOut, err := s.runDocker(ctx, "inspect", "--format", "{{.Config.Image}}", up.Services[0].Container)
+	if err != nil {
+		t.Fatalf("inspect seaweedfs image: %v: %s", err, errOut)
+	}
+	if got := strings.TrimSpace(image); got != defaultSeaweedfsImage {
+		t.Errorf("seaweedfs image = %q, want %q", got, defaultSeaweedfsImage)
 	}
 	for _, role := range []EndpointRole{RoleMaster, RoleVolume, RoleFiler, RoleS3} {
 		ep, ok := up.Services[0].Endpoints[role]

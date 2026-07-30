@@ -242,7 +242,7 @@ func TestCmdReload_SurfacesServerError(t *testing.T) {
 
 // TestCmdUp_SendsImageInBody asserts that a non-empty image is forwarded to the
 // server as the request body's "image" field, alongside repo/worktree/services.
-// This is the per-worktree image-pinning path (e.g. pgvector/pgvector:pg17).
+// This is the per-worktree image-pinning path (e.g. pgvector/pgvector:pg18).
 func TestCmdUp_SendsImageInBody(t *testing.T) {
 	var capturedPath string
 	var capturedBody map[string]any
@@ -257,7 +257,7 @@ func TestCmdUp_SendsImageInBody(t *testing.T) {
 
 	rc := &runCtx{client: newClient(srv.URL), url: srv.URL}
 	_, restore := captureStdout(t)
-	err := cmdUp(rc, "r", "w", "pgvector/pgvector:pg17", []string{"postgres"})
+	err := cmdUp(rc, "r", "w", "pgvector/pgvector:pg18", []string{"postgres"})
 	restore()
 	if err != nil {
 		t.Fatalf("cmdUp: %v", err)
@@ -266,8 +266,8 @@ func TestCmdUp_SendsImageInBody(t *testing.T) {
 	if capturedPath != "/v1/up" {
 		t.Errorf("path = %q, want /v1/up", capturedPath)
 	}
-	if capturedBody["image"] != "pgvector/pgvector:pg17" {
-		t.Errorf("body.image = %v, want pgvector/pgvector:pg17", capturedBody["image"])
+	if capturedBody["image"] != "pgvector/pgvector:pg18" {
+		t.Errorf("body.image = %v, want pgvector/pgvector:pg18", capturedBody["image"])
 	}
 	if capturedBody["repo"] != "r" || capturedBody["worktree"] != "w" {
 		t.Errorf("body missing repo/worktree: %+v", capturedBody)
@@ -312,13 +312,13 @@ func TestCmdReload_SendsImageInBody(t *testing.T) {
 
 	rc := &runCtx{client: newClient(srv.URL), url: srv.URL}
 	_, restore := captureStdout(t)
-	err := cmdReload(rc, "r", "w", "pgvector/pgvector:pg17", []string{"postgres"})
+	err := cmdReload(rc, "r", "w", "pgvector/pgvector:pg18", []string{"postgres"})
 	restore()
 	if err != nil {
 		t.Fatalf("cmdReload: %v", err)
 	}
-	if capturedBody["image"] != "pgvector/pgvector:pg17" {
-		t.Errorf("body.image = %v, want pgvector/pgvector:pg17", capturedBody["image"])
+	if capturedBody["image"] != "pgvector/pgvector:pg18" {
+		t.Errorf("body.image = %v, want pgvector/pgvector:pg18", capturedBody["image"])
 	}
 }
 

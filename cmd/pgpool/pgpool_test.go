@@ -157,6 +157,28 @@ func TestServiceRegistry_Validity(t *testing.T) {
 	}
 }
 
+func TestServiceRegistry_UsesPG18PgvectorAndSeaweedFS440(t *testing.T) {
+	if got := serviceDefs["postgres"].Image; got != "pgvector/pgvector:pg18" {
+		t.Errorf("postgres image = %q, want pgvector/pgvector:pg18", got)
+	}
+	if got := serviceDefs["seaweedfs"].Image; got != "chrislusf/seaweedfs:4.40" {
+		t.Errorf("seaweedfs image = %q, want chrislusf/seaweedfs:4.40", got)
+	}
+}
+
+func TestImageFor_UsesConfiguredPostgresImageAndExplicitOverride(t *testing.T) {
+	s := &Server{cfg: Config{PgImage: "pgvector/pgvector:pg18"}}
+	if got := s.imageFor(postgresDef, ""); got != "pgvector/pgvector:pg18" {
+		t.Errorf("configured postgres image = %q", got)
+	}
+	if got := s.imageFor(postgresDef, "pgvector/pgvector:pg18-bookworm"); got != "pgvector/pgvector:pg18-bookworm" {
+		t.Errorf("explicit postgres image = %q", got)
+	}
+	if got := s.imageFor(seaweedfsDef, "ignored:tag"); got != "chrislusf/seaweedfs:4.40" {
+		t.Errorf("seaweedfs image = %q", got)
+	}
+}
+
 func TestParseServicesCSV(t *testing.T) {
 	cases := map[string][]string{
 		"postgres":              {"postgres"},
