@@ -31,18 +31,16 @@ import (
 const (
 	defaultURL       = "http://localhost:8080"
 	defaultConfigRel = ".config/pgpool/pgpool.json"
-	// claudeBeginPrefix matches any version of the begin marker so init can
-	// replace older blocks (e.g. v:1, v:2) instead of stacking new ones beside them.
-	claudeBeginPrefix = "<!-- BEGIN PGPOOL INTEGRATION"
-	claudeEndMarker   = "<!-- END PGPOOL INTEGRATION -->"
-	httpTimeout       = 60 * time.Second
+	agentBeginPrefix = "<!-- BEGIN PGPOOL INTEGRATION"
+	agentEndMarker   = "<!-- END PGPOOL INTEGRATION -->"
+	httpTimeout      = 60 * time.Second
 )
 
 // cliVersion is set at link time via -ldflags "-X main.cliVersion=..."
 var cliVersion = "dev"
 
-// claudeSegment is what `pgpoolcli init` appends to CLAUDE.md.
-const claudeSegment = `<!-- BEGIN PGPOOL INTEGRATION v:4 -->
+// agentSegment is what `pgpoolcli init` adds to AGENTS.md.
+const agentSegment = `<!-- BEGIN PGPOOL INTEGRATION v:4 -->
 ## Per-worktree services (pgpool)
 This project uses **pgpoolcli** to manage ephemeral per-worktree services (Postgres, SeaweedFS, and fake-gcs-server supported today).
 Run ` + "`pgpoolcli prime`" + ` for full workflow context including the per-service endpoint catalog.
@@ -122,7 +120,7 @@ Commands:
 
   pgpoolcli init [--url URL] [--force]
     Write ~/.config/pgpool/pgpool.json and append the pgpool block to
-    ./CLAUDE.md if not already present.
+    ./AGENTS.md if not already present.
 
   pgpoolcli update [--version TAG] [--dir DIR]
     Self-update pgpool and pgpoolcli to the latest release (or --version TAG)
@@ -779,6 +777,28 @@ func cmdInit(rc *runCtx, flagURL string, force, yes bool, in io.Reader, out io.W
 		return errors.New("url cannot be empty")
 	}
 
+	agentsExisting, err := os.ReadFile("AGENTS.md")
+	if errors.Is(err, os.ErrNotExist) {
+		agentsExisting = nil
+	} else if err != nil {
+		return fmt.Errorf("read AGENTS.md: %w", err)
+	}
+	claudeExisting, err := os.ReadFile("CLAUDE.md")
+	if errors.Is(err, os.ErrNotExist) {
+		claudeExisting = nil
+	} else if err != nil {
+		return fmt.Errorf("read CLAUDE.md: %w", err)
+	}
+
+	nextAgents, agentAction, err := mergeAgentBlock(agentsExisting, "AGENTS.md")
+	if err != nil {
+		return err
+	}
+	nextClaude, legacyRemoved, err := removeAgentBlock(claudeExisting, "CLAUDE.md")
+	if err != nil {
+		return err
+	}
+
 	// writeConfig creates the parent directory if it is missing.
 	switch {
 	case !configExists:
@@ -797,86 +817,99 @@ func cmdInit(rc *runCtx, flagURL string, force, yes bool, in io.Reader, out io.W
 		fmt.Fprintf(out, "config already exists at %s (use --force to overwrite)\n", rc.cfgPath)
 	}
 
-	// CLAUDE.md in current dir.
-	claudePath := "CLAUDE.md"
-	existing, err := os.ReadFile(claudePath)
-	if errors.Is(err, os.ErrNotExist) {
-		existing = nil
-	} else if err != nil {
-		return fmt.Errorf("read CLAUDE.md: %w", err)
+	if agentAction == agentUnchanged {
+		fmt.Fprintln(out, "AGENTS.md already contains the current pgpool integration block - not modified")
+	} else {
+		if err := os.WriteFile("AGENTS.md", nextAgents, 0o644); err != nil {
+			return fmt.Errorf("write AGENTS.md: %w", err)
+		}
+		switch agentAction {
+		case agentReplaced:
+			fmt.Fprintln(out, "replaced existing pgpool integration block in AGENTS.md")
+		case agentAppended:
+			fmt.Fprintln(out, "appended pgpool integration block to AGENTS.md")
+		case agentCreated:
+			fmt.Fprintln(out, "created AGENTS.md with pgpool integration block")
+		}
 	}
 
-	next, action, err := mergeClaudeBlock(existing)
-	if err != nil {
-		return err
-	}
-	if action == claudeUnchanged {
-		fmt.Fprintf(out, "CLAUDE.md already contains the current pgpool integration block - not modified\n")
-		return nil
-	}
-	if err := os.WriteFile(claudePath, next, 0o644); err != nil {
-		return fmt.Errorf("write CLAUDE.md: %w", err)
-	}
-	switch action {
-	case claudeReplaced:
-		fmt.Fprintf(out, "replaced existing pgpool integration block in %s\n", claudePath)
-	case claudeAppended:
-		fmt.Fprintf(out, "appended pgpool integration block to %s\n", claudePath)
-	case claudeCreated:
-		fmt.Fprintf(out, "created %s with pgpool integration block\n", claudePath)
+	if legacyRemoved {
+		if len(bytes.TrimSpace(nextClaude)) == 0 {
+			if err := os.Remove("CLAUDE.md"); err != nil {
+				return fmt.Errorf("remove empty CLAUDE.md after migrating pgpool integration: %w", err)
+			}
+			fmt.Fprintln(out, "removed legacy pgpool integration block and empty CLAUDE.md")
+		} else {
+			if err := os.WriteFile("CLAUDE.md", nextClaude, 0o644); err != nil {
+				return fmt.Errorf("write CLAUDE.md after migrating pgpool integration: %w", err)
+			}
+			fmt.Fprintln(out, "removed legacy pgpool integration block from CLAUDE.md")
+		}
 	}
 	return nil
 }
 
-type claudeMergeAction int
+type agentMergeAction int
 
 const (
-	claudeUnchanged claudeMergeAction = iota
-	claudeReplaced
-	claudeAppended
-	claudeCreated
+	agentUnchanged agentMergeAction = iota
+	agentReplaced
+	agentAppended
+	agentCreated
 )
 
-// mergeClaudeBlock returns the rewritten CLAUDE.md content plus what changed.
-// Any existing PGPOOL INTEGRATION block (any version marker) is replaced; if
-// none is present the segment is appended. The end marker must follow the
-// begin marker - a stray begin without a matching end is an error.
-func mergeClaudeBlock(existing []byte) ([]byte, claudeMergeAction, error) {
+func locateAgentBlock(existing []byte, path string) (int, int, bool, error) {
+	beginIdx := bytes.Index(existing, []byte(agentBeginPrefix))
+	if beginIdx < 0 {
+		return 0, 0, false, nil
+	}
+	endRel := bytes.Index(existing[beginIdx:], []byte(agentEndMarker))
+	if endRel < 0 {
+		return 0, 0, false, fmt.Errorf("%s has %q without matching %q", path, agentBeginPrefix, agentEndMarker)
+	}
+	return beginIdx, beginIdx + endRel + len(agentEndMarker), true, nil
+}
+
+func mergeAgentBlock(existing []byte, path string) ([]byte, agentMergeAction, error) {
 	if len(existing) == 0 {
-		var b bytes.Buffer
-		b.WriteString(claudeSegment)
-		b.WriteByte('\n')
-		return b.Bytes(), claudeCreated, nil
+		return append([]byte(agentSegment), '\n'), agentCreated, nil
 	}
 
-	beginIdx := bytes.Index(existing, []byte(claudeBeginPrefix))
-	if beginIdx < 0 {
+	beginIdx, endIdx, found, err := locateAgentBlock(existing, path)
+	if err != nil {
+		return nil, agentUnchanged, err
+	}
+	if !found {
 		var b bytes.Buffer
 		b.Write(existing)
 		if !bytes.HasSuffix(existing, []byte("\n")) {
 			b.WriteByte('\n')
 		}
 		b.WriteByte('\n')
-		b.WriteString(claudeSegment)
+		b.WriteString(agentSegment)
 		b.WriteByte('\n')
-		return b.Bytes(), claudeAppended, nil
+		return b.Bytes(), agentAppended, nil
 	}
-
-	endRel := bytes.Index(existing[beginIdx:], []byte(claudeEndMarker))
-	if endRel < 0 {
-		return nil, claudeUnchanged, fmt.Errorf("CLAUDE.md has %q without matching %q", claudeBeginPrefix, claudeEndMarker)
-	}
-	endIdx := beginIdx + endRel + len(claudeEndMarker)
-
-	if string(existing[beginIdx:endIdx]) == claudeSegment {
-		return existing, claudeUnchanged, nil
+	if string(existing[beginIdx:endIdx]) == agentSegment {
+		return existing, agentUnchanged, nil
 	}
 
 	var b bytes.Buffer
 	b.Write(existing[:beginIdx])
-	b.WriteString(claudeSegment)
+	b.WriteString(agentSegment)
 	b.Write(existing[endIdx:])
-	return b.Bytes(), claudeReplaced, nil
+	return b.Bytes(), agentReplaced, nil
+}
+
+func removeAgentBlock(existing []byte, path string) ([]byte, bool, error) {
+	beginIdx, endIdx, found, err := locateAgentBlock(existing, path)
+	if err != nil || !found {
+		return existing, false, err
+	}
+	var b bytes.Buffer
+	b.Write(existing[:beginIdx])
+	b.Write(existing[endIdx:])
+	return b.Bytes(), true, nil
 }
 
 // ---------- self-update ----------
@@ -994,7 +1027,7 @@ Commands:
   list     List all pgpool-managed containers on the server
   health   Check that the server is reachable (also reports server version)
   config   Print the resolved config
-  init     Write a config file and append a block to CLAUDE.md
+  init     Write a config file and append a block to AGENTS.md
   update   Self-update pgpool and pgpoolcli to the latest release
   prime    Print the full workflow reference
 

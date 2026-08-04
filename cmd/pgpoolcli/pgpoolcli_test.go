@@ -91,89 +91,219 @@ func mustHostname(t *testing.T, raw string) string {
 	return u.Hostname()
 }
 
-// initTestEnv writes seedClaude (when non-empty) into a fresh tempdir, runs
-// cmdInit non-interactively against the server URL "http://example", and
-// returns the resulting CLAUDE.md bytes plus the operator output.
-func initTestEnv(t *testing.T, seedClaude string) ([]byte, string) {
-	t.Helper()
-	dir := t.TempDir()
-	t.Chdir(dir)
+type initFiles struct {
+	agents *string
+	claude *string
+}
 
-	cfgPath := filepath.Join(dir, "pgpool.json")
-	if seedClaude != "" {
-		if err := os.WriteFile("CLAUDE.md", []byte(seedClaude), 0o644); err != nil {
+type initResult struct {
+	agents       []byte
+	agentsExists bool
+	claude       []byte
+	claudeExists bool
+	output       string
+	configExists bool
+}
+
+func stringPtr(s string) *string { return &s }
+
+func writeInitFiles(t *testing.T, files initFiles) {
+	t.Helper()
+	if files.agents != nil {
+		if err := os.WriteFile("AGENTS.md", []byte(*files.agents), 0o644); err != nil {
+			t.Fatalf("seed AGENTS.md: %v", err)
+		}
+	}
+	if files.claude != nil {
+		if err := os.WriteFile("CLAUDE.md", []byte(*files.claude), 0o644); err != nil {
 			t.Fatalf("seed CLAUDE.md: %v", err)
 		}
 	}
-	rc := &runCtx{
-		client:  newClient("http://example"),
-		url:     "http://example",
-		cfgPath: cfgPath,
-	}
+}
+
+func initTestEnv(t *testing.T, files initFiles) initResult {
+	t.Helper()
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeInitFiles(t, files)
+
+	cfgPath := filepath.Join(dir, "pgpool.json")
+	rc := &runCtx{client: newClient("http://example"), url: "http://example", cfgPath: cfgPath}
 	var out bytes.Buffer
 	if err := cmdInit(rc, "http://example", false, true, strings.NewReader(""), &out); err != nil {
 		t.Fatalf("cmdInit: %v", err)
 	}
-	got, err := os.ReadFile("CLAUDE.md")
+
+	agents, agentsErr := os.ReadFile("AGENTS.md")
+	claude, claudeErr := os.ReadFile("CLAUDE.md")
+	return initResult{
+		agents:       agents,
+		agentsExists: agentsErr == nil,
+		claude:       claude,
+		claudeExists: claudeErr == nil,
+		output:       out.String(),
+		configExists: fileExists(cfgPath),
+	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func captureStderr(t *testing.T) func() string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
 	if err != nil {
-		t.Fatalf("read CLAUDE.md: %v", err)
+		t.Fatalf("pipe: %v", err)
 	}
-	return got, out.String()
-}
-
-func TestCmdInit_ReplacesOlderIntegrationBlock(t *testing.T) {
-	const oldBlock = `<!-- BEGIN PGPOOL INTEGRATION v:1 -->
-old pgpool docs that should disappear
-<!-- END PGPOOL INTEGRATION -->`
-	seed := "# Project\n\nintro\n\n" + oldBlock + "\n\n## Other\n\ntail content\n"
-
-	got, _ := initTestEnv(t, seed)
-
-	if bytes.Count(got, []byte("<!-- BEGIN PGPOOL INTEGRATION")) != 1 {
-		t.Fatalf("expected exactly one PGPOOL block, got:\n%s", got)
-	}
-	if bytes.Contains(got, []byte("v:1")) {
-		t.Errorf("old v:1 marker still present:\n%s", got)
-	}
-	if !bytes.Contains(got, []byte("v:4")) {
-		t.Errorf("new v:4 marker missing:\n%s", got)
-	}
-	if bytes.Contains(got, []byte("old pgpool docs that should disappear")) {
-		t.Errorf("old block body still present:\n%s", got)
-	}
-	if !bytes.Contains(got, []byte("## Other")) || !bytes.Contains(got, []byte("tail content")) {
-		t.Errorf("non-pgpool content was clobbered:\n%s", got)
+	os.Stderr = w
+	return func() string {
+		_ = w.Close()
+		os.Stderr = old
+		buf, _ := io.ReadAll(r)
+		return string(buf)
 	}
 }
 
-func TestCmdInit_LeavesCurrentBlockUntouched(t *testing.T) {
-	seed := "# Project\n\n" + claudeSegment + "\n"
-	got, out := initTestEnv(t, seed)
-
-	if !bytes.Equal(got, []byte(seed)) {
-		t.Errorf("file modified when block already current:\nwant:\n%s\ngot:\n%s", seed, got)
+func TestCmdInit_CreatesAgentsFileWhenAbsent(t *testing.T) {
+	got := initTestEnv(t, initFiles{})
+	if !got.agentsExists || !bytes.Contains(got.agents, []byte(agentSegment)) {
+		t.Fatalf("AGENTS.md missing current integration block:\n%s", got.agents)
 	}
-	if !strings.Contains(out, "already") {
-		t.Errorf("expected 'already' in operator message, got %q", out)
+	if got.claudeExists {
+		t.Fatal("CLAUDE.md should not be created")
 	}
-}
-
-func TestCmdInit_AppendsWhenNoBlockPresent(t *testing.T) {
-	seed := "# Project\n\nintro\n"
-	got, _ := initTestEnv(t, seed)
-
-	if !bytes.HasPrefix(got, []byte(seed)) {
-		t.Errorf("preexisting content not preserved:\n%s", got)
-	}
-	if bytes.Count(got, []byte("<!-- BEGIN PGPOOL INTEGRATION")) != 1 {
-		t.Errorf("expected one block, got:\n%s", got)
+	if !strings.Contains(got.output, "AGENTS.md") {
+		t.Fatalf("operator output does not identify AGENTS.md: %q", got.output)
 	}
 }
 
-func TestCmdInit_CreatesFileWhenAbsent(t *testing.T) {
-	got, _ := initTestEnv(t, "")
-	if !bytes.Contains(got, []byte(claudeSegment)) {
-		t.Errorf("expected claudeSegment in fresh file:\n%s", got)
+func TestCmdInit_AppendsToAgentsWithoutClobberingContent(t *testing.T) {
+	seed := "# Project\n\nkeep me\n"
+	got := initTestEnv(t, initFiles{agents: stringPtr(seed)})
+	if !bytes.HasPrefix(got.agents, []byte(seed)) || bytes.Count(got.agents, []byte(agentBeginPrefix)) != 1 {
+		t.Fatalf("AGENTS.md was not appended safely:\n%s", got.agents)
+	}
+}
+
+func TestCmdInit_ReplacesOlderAgentsBlock(t *testing.T) {
+	old := "# Project\n\n<!-- BEGIN PGPOOL INTEGRATION v:1 -->\nold\n<!-- END PGPOOL INTEGRATION -->\n\nkeep\n"
+	got := initTestEnv(t, initFiles{agents: stringPtr(old)})
+	if bytes.Contains(got.agents, []byte("v:1")) || !bytes.Contains(got.agents, []byte("v:4")) {
+		t.Fatalf("old AGENTS.md block was not replaced:\n%s", got.agents)
+	}
+	if !bytes.Contains(got.agents, []byte("keep")) {
+		t.Fatalf("unrelated AGENTS.md content was lost:\n%s", got.agents)
+	}
+}
+
+func TestCmdInit_LeavesCurrentAgentsBlockUntouched(t *testing.T) {
+	seed := "# Project\n\n" + agentSegment + "\n"
+	got := initTestEnv(t, initFiles{agents: stringPtr(seed)})
+	if !bytes.Equal(got.agents, []byte(seed)) {
+		t.Fatalf("current AGENTS.md changed:\n%s", got.agents)
+	}
+	if !strings.Contains(got.output, "already") {
+		t.Fatalf("no-op output missing 'already': %q", got.output)
+	}
+}
+
+func TestCmdInit_MigratesLegacyClaudeBlock(t *testing.T) {
+	legacy := "# Claude only\n\n<!-- BEGIN PGPOOL INTEGRATION v:3 -->\nold\n<!-- END PGPOOL INTEGRATION -->\n\nkeep this\n"
+	got := initTestEnv(t, initFiles{claude: stringPtr(legacy)})
+	if !bytes.Contains(got.agents, []byte(agentSegment)) {
+		t.Fatalf("AGENTS.md missing migrated block:\n%s", got.agents)
+	}
+	if !got.claudeExists || bytes.Contains(got.claude, []byte(agentBeginPrefix)) || !bytes.Contains(got.claude, []byte("keep this")) {
+		t.Fatalf("CLAUDE.md cleanup was unsafe:\n%s", got.claude)
+	}
+}
+
+func TestCmdInit_RemovesDuplicateClaudeBlock(t *testing.T) {
+	agents := "# Agents\n\n" + agentSegment + "\n"
+	claude := "# Claude\n\n" + agentSegment + "\n"
+	got := initTestEnv(t, initFiles{agents: stringPtr(agents), claude: stringPtr(claude)})
+	if bytes.Count(got.agents, []byte(agentBeginPrefix)) != 1 || bytes.Contains(got.claude, []byte(agentBeginPrefix)) {
+		t.Fatalf("managed block did not converge: AGENTS=%q CLAUDE=%q", got.agents, got.claude)
+	}
+}
+
+func TestCmdInit_RemovesClaudeFileWhenOnlyLegacyBlockRemains(t *testing.T) {
+	claude := "\n" + agentSegment + "\n\n"
+	got := initTestEnv(t, initFiles{claude: stringPtr(claude)})
+	if got.claudeExists {
+		t.Fatalf("empty legacy CLAUDE.md should be removed: %q", got.claude)
+	}
+	if !got.agentsExists {
+		t.Fatal("AGENTS.md was not created before legacy cleanup")
+	}
+}
+
+func TestCmdInit_IsIdempotentAfterLegacyMigration(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeInitFiles(t, initFiles{claude: stringPtr(agentSegment + "\n")})
+	cfgPath := filepath.Join(dir, "pgpool.json")
+	rc := &runCtx{client: newClient("http://example"), url: "http://example", cfgPath: cfgPath}
+	run := func() {
+		if err := cmdInit(rc, "http://example", false, true, strings.NewReader(""), io.Discard); err != nil {
+			t.Fatalf("cmdInit: %v", err)
+		}
+	}
+	run()
+	firstAgents, err := os.ReadFile("AGENTS.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstConfig, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run()
+	secondAgents, _ := os.ReadFile("AGENTS.md")
+	secondConfig, _ := os.ReadFile(cfgPath)
+	if !bytes.Equal(firstAgents, secondAgents) || !bytes.Equal(firstConfig, secondConfig) || fileExists("CLAUDE.md") {
+		t.Fatal("second init changed the converged files")
+	}
+}
+
+func TestAgentDocumentationReferencesUseAgentsMD(t *testing.T) {
+	if !strings.Contains(primeText, "./AGENTS.md") || strings.Contains(primeText, "./CLAUDE.md") {
+		t.Fatalf("prime text has stale integration destination:\n%s", primeText)
+	}
+	restore := captureStderr(t)
+	usage()
+	got := restore()
+	if !strings.Contains(got, "AGENTS.md") || strings.Contains(got, "append a block to CLAUDE.md") {
+		t.Fatalf("usage has stale integration destination:\n%s", got)
+	}
+}
+
+func TestCmdInit_ValidatesBothInstructionFilesBeforeWriting(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files initFiles
+		path  string
+	}{
+		{name: "agents", files: initFiles{agents: stringPtr(agentBeginPrefix + " v:1 -->\nmissing end")}, path: "AGENTS.md"},
+		{name: "claude", files: initFiles{claude: stringPtr(agentBeginPrefix + " v:1 -->\nmissing end")}, path: "CLAUDE.md"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Chdir(dir)
+			writeInitFiles(t, tc.files)
+			cfgPath := filepath.Join(dir, "pgpool.json")
+			rc := &runCtx{client: newClient("http://example"), url: "http://example", cfgPath: cfgPath}
+			err := cmdInit(rc, "http://example", false, true, strings.NewReader(""), io.Discard)
+			if err == nil || !strings.Contains(err.Error(), tc.path) {
+				t.Fatalf("error = %v, want path %s", err, tc.path)
+			}
+			if fileExists(cfgPath) || fileExists("AGENTS.md") != (tc.files.agents != nil) || fileExists("CLAUDE.md") != (tc.files.claude != nil) {
+				t.Fatal("validation failure changed files")
+			}
+		})
 	}
 }
 
@@ -339,30 +469,5 @@ func captureStdout(t *testing.T) (*os.File, func() string) {
 		os.Stdout = old
 		buf, _ := io.ReadAll(r)
 		return string(buf)
-	}
-}
-
-func TestCmdInit_ReplacesV3WithV4(t *testing.T) {
-	const oldBlock = `<!-- BEGIN PGPOOL INTEGRATION v:3 -->
-old v3 body
-<!-- END PGPOOL INTEGRATION -->`
-	seed := "# Project\n\n" + oldBlock + "\n"
-
-	got, _ := initTestEnv(t, seed)
-
-	if bytes.Count(got, []byte("<!-- BEGIN PGPOOL INTEGRATION")) != 1 {
-		t.Fatalf("want exactly one block, got:\n%s", got)
-	}
-	if bytes.Contains(got, []byte("v:3")) {
-		t.Errorf("v:3 marker should be gone:\n%s", got)
-	}
-	if !bytes.Contains(got, []byte("v:4")) {
-		t.Errorf("v:4 marker missing:\n%s", got)
-	}
-	if !bytes.Contains(got, []byte("pgpoolcli reload")) {
-		t.Errorf("expected reload to be mentioned in updated segment:\n%s", got)
-	}
-	if !bytes.Contains(got, []byte("fake-gcs")) {
-		t.Errorf("expected fake-gcs to be mentioned in updated segment:\n%s", got)
 	}
 }
