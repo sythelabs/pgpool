@@ -210,6 +210,20 @@ func TestCmdInit_LeavesCurrentAgentsBlockUntouched(t *testing.T) {
 	}
 }
 
+func TestCmdInit_ConvergesMultipleAgentsBlocksPreservingOtherBytes(t *testing.T) {
+	oldBlock := "<!-- BEGIN PGPOOL INTEGRATION v:1 -->\nold\n<!-- END PGPOOL INTEGRATION -->"
+	seed := "before\n" + agentSegment + "\nbetween\n" + oldBlock + "\nafter\n"
+	want := "before\n" + agentSegment + "\nbetween\n\nafter\n"
+
+	got := initTestEnv(t, initFiles{agents: stringPtr(seed)})
+	if !bytes.Equal(got.agents, []byte(want)) {
+		t.Fatalf("AGENTS.md did not converge while preserving non-marker bytes:\ngot:  %q\nwant: %q", got.agents, want)
+	}
+	if bytes.Count(got.agents, []byte(agentBeginPrefix)) != 1 {
+		t.Fatalf("AGENTS.md managed block count = %d, want 1", bytes.Count(got.agents, []byte(agentBeginPrefix)))
+	}
+}
+
 func TestCmdInit_MigratesLegacyClaudeBlock(t *testing.T) {
 	legacy := "# Claude only\n\n<!-- BEGIN PGPOOL INTEGRATION v:3 -->\nold\n<!-- END PGPOOL INTEGRATION -->\n\nkeep this\n"
 	got := initTestEnv(t, initFiles{claude: stringPtr(legacy)})
@@ -227,6 +241,20 @@ func TestCmdInit_RemovesDuplicateClaudeBlock(t *testing.T) {
 	got := initTestEnv(t, initFiles{agents: stringPtr(agents), claude: stringPtr(claude)})
 	if bytes.Count(got.agents, []byte(agentBeginPrefix)) != 1 || bytes.Contains(got.claude, []byte(agentBeginPrefix)) {
 		t.Fatalf("managed block did not converge: AGENTS=%q CLAUDE=%q", got.agents, got.claude)
+	}
+}
+
+func TestCmdInit_RemovesAllClaudeBlocksPreservingOtherBytes(t *testing.T) {
+	oldBlock := "<!-- BEGIN PGPOOL INTEGRATION v:2 -->\nold\n<!-- END PGPOOL INTEGRATION -->"
+	claude := "before\n" + agentSegment + "\nbetween\n" + oldBlock + "\nafter\n"
+	wantClaude := "before\n\nbetween\n\nafter\n"
+
+	got := initTestEnv(t, initFiles{claude: stringPtr(claude)})
+	if !got.claudeExists || !bytes.Equal(got.claude, []byte(wantClaude)) {
+		t.Fatalf("CLAUDE.md cleanup did not preserve all non-marker bytes:\ngot:  %q\nwant: %q", got.claude, wantClaude)
+	}
+	if bytes.Contains(got.claude, []byte(agentBeginPrefix)) {
+		t.Fatalf("CLAUDE.md still contains a managed block: %q", got.claude)
 	}
 }
 
@@ -282,6 +310,7 @@ func TestAgentDocumentationReferencesUseAgentsMD(t *testing.T) {
 }
 
 func TestCmdInit_ValidatesBothInstructionFilesBeforeWriting(t *testing.T) {
+	validBlock := "<!-- BEGIN PGPOOL INTEGRATION v:1 -->\nold\n<!-- END PGPOOL INTEGRATION -->"
 	for _, tc := range []struct {
 		name  string
 		files initFiles
@@ -289,18 +318,25 @@ func TestCmdInit_ValidatesBothInstructionFilesBeforeWriting(t *testing.T) {
 	}{
 		{name: "agents", files: initFiles{agents: stringPtr(agentBeginPrefix + " v:1 -->\nmissing end")}, path: "AGENTS.md"},
 		{name: "claude", files: initFiles{claude: stringPtr(agentBeginPrefix + " v:1 -->\nmissing end")}, path: "CLAUDE.md"},
+		{name: "agents trailing unmatched begin", files: initFiles{agents: stringPtr(validBlock + "\nkeep\n" + agentBeginPrefix + " v:2 -->\nmissing end")}, path: "AGENTS.md"},
+		{name: "agents nested begin", files: initFiles{agents: stringPtr(agentBeginPrefix + " v:1 -->\n" + agentBeginPrefix + " v:2 -->\nold\n" + agentEndMarker)}, path: "AGENTS.md"},
+		{name: "claude nested begin", files: initFiles{claude: stringPtr(agentBeginPrefix + " v:1 -->\n" + agentBeginPrefix + " v:2 -->\nold\n" + agentEndMarker)}, path: "CLAUDE.md"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			t.Chdir(dir)
 			writeInitFiles(t, tc.files)
+			beforeAgents, _ := os.ReadFile("AGENTS.md")
+			beforeClaude, _ := os.ReadFile("CLAUDE.md")
 			cfgPath := filepath.Join(dir, "pgpool.json")
 			rc := &runCtx{client: newClient("http://example"), url: "http://example", cfgPath: cfgPath}
 			err := cmdInit(rc, "http://example", false, true, strings.NewReader(""), io.Discard)
 			if err == nil || !strings.Contains(err.Error(), tc.path) {
 				t.Fatalf("error = %v, want path %s", err, tc.path)
 			}
-			if fileExists(cfgPath) || fileExists("AGENTS.md") != (tc.files.agents != nil) || fileExists("CLAUDE.md") != (tc.files.claude != nil) {
+			afterAgents, _ := os.ReadFile("AGENTS.md")
+			afterClaude, _ := os.ReadFile("CLAUDE.md")
+			if fileExists(cfgPath) || fileExists("AGENTS.md") != (tc.files.agents != nil) || fileExists("CLAUDE.md") != (tc.files.claude != nil) || !bytes.Equal(afterAgents, beforeAgents) || !bytes.Equal(afterClaude, beforeClaude) {
 				t.Fatal("validation failure changed files")
 			}
 		})

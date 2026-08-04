@@ -858,16 +858,32 @@ const (
 	agentCreated
 )
 
-func locateAgentBlock(existing []byte, path string) (int, int, bool, error) {
-	beginIdx := bytes.Index(existing, []byte(agentBeginPrefix))
-	if beginIdx < 0 {
-		return 0, 0, false, nil
+type agentBlockSpan struct {
+	begin int
+	end   int
+}
+
+func locateAgentBlocks(existing []byte, path string) ([]agentBlockSpan, error) {
+	var spans []agentBlockSpan
+	for offset := 0; ; {
+		beginRel := bytes.Index(existing[offset:], []byte(agentBeginPrefix))
+		if beginRel < 0 {
+			return spans, nil
+		}
+		beginIdx := offset + beginRel
+		contentIdx := beginIdx + len(agentBeginPrefix)
+		endRel := bytes.Index(existing[contentIdx:], []byte(agentEndMarker))
+		if endRel < 0 {
+			return nil, fmt.Errorf("%s has %q without matching %q", path, agentBeginPrefix, agentEndMarker)
+		}
+		endIdx := contentIdx + endRel
+		if nestedRel := bytes.Index(existing[contentIdx:endIdx], []byte(agentBeginPrefix)); nestedRel >= 0 {
+			return nil, fmt.Errorf("%s has nested %q markers", path, agentBeginPrefix)
+		}
+		spanEnd := endIdx + len(agentEndMarker)
+		spans = append(spans, agentBlockSpan{begin: beginIdx, end: spanEnd})
+		offset = spanEnd
 	}
-	endRel := bytes.Index(existing[beginIdx:], []byte(agentEndMarker))
-	if endRel < 0 {
-		return 0, 0, false, fmt.Errorf("%s has %q without matching %q", path, agentBeginPrefix, agentEndMarker)
-	}
-	return beginIdx, beginIdx + endRel + len(agentEndMarker), true, nil
 }
 
 func mergeAgentBlock(existing []byte, path string) ([]byte, agentMergeAction, error) {
@@ -875,11 +891,11 @@ func mergeAgentBlock(existing []byte, path string) ([]byte, agentMergeAction, er
 		return append([]byte(agentSegment), '\n'), agentCreated, nil
 	}
 
-	beginIdx, endIdx, found, err := locateAgentBlock(existing, path)
+	spans, err := locateAgentBlocks(existing, path)
 	if err != nil {
 		return nil, agentUnchanged, err
 	}
-	if !found {
+	if len(spans) == 0 {
 		var b bytes.Buffer
 		b.Write(existing)
 		if !bytes.HasSuffix(existing, []byte("\n")) {
@@ -890,25 +906,34 @@ func mergeAgentBlock(existing []byte, path string) ([]byte, agentMergeAction, er
 		b.WriteByte('\n')
 		return b.Bytes(), agentAppended, nil
 	}
-	if string(existing[beginIdx:endIdx]) == agentSegment {
+	if len(spans) == 1 && string(existing[spans[0].begin:spans[0].end]) == agentSegment {
 		return existing, agentUnchanged, nil
 	}
 
 	var b bytes.Buffer
-	b.Write(existing[:beginIdx])
+	b.Write(existing[:spans[0].begin])
 	b.WriteString(agentSegment)
-	b.Write(existing[endIdx:])
+	cursor := spans[0].end
+	for _, span := range spans[1:] {
+		b.Write(existing[cursor:span.begin])
+		cursor = span.end
+	}
+	b.Write(existing[cursor:])
 	return b.Bytes(), agentReplaced, nil
 }
 
 func removeAgentBlock(existing []byte, path string) ([]byte, bool, error) {
-	beginIdx, endIdx, found, err := locateAgentBlock(existing, path)
-	if err != nil || !found {
+	spans, err := locateAgentBlocks(existing, path)
+	if err != nil || len(spans) == 0 {
 		return existing, false, err
 	}
 	var b bytes.Buffer
-	b.Write(existing[:beginIdx])
-	b.Write(existing[endIdx:])
+	cursor := 0
+	for _, span := range spans {
+		b.Write(existing[cursor:span.begin])
+		cursor = span.end
+	}
+	b.Write(existing[cursor:])
 	return b.Bytes(), true, nil
 }
 

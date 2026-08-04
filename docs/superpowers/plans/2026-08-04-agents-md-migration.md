@@ -15,7 +15,7 @@
 - Do not create `CLAUDE.md` in consumer projects.
 - Preserve bytes outside managed marker spans.
 - Delete legacy `CLAUDE.md` only when removing its managed block leaves whitespace only.
-- Parse both instruction files before writing either; write `AGENTS.md` before legacy cleanup.
+- Parse every managed marker span in both instruction files before writing either; reject unmatched or nested begin markers, write `AGENTS.md` before legacy cleanup.
 - Keep marker text and integration version `v:4` unchanged.
 - Do not rewrite historical documents under `docs/superpowers/` merely to update old filename references.
 - New files use mode `0644`; existing `os.WriteFile` behavior preserves existing file mode.
@@ -38,7 +38,7 @@
 
 **Interfaces:**
 - Consumes: Existing `cmdInit`, the `PGPOOL INTEGRATION` begin/end markers, `os.ReadFile`, `os.WriteFile`, and `os.Remove`.
-- Produces: `agentSegment string`, `agentMergeAction`, `mergeAgentBlock(existing []byte, path string) ([]byte, agentMergeAction, error)`, and `removeAgentBlock(existing []byte, path string) ([]byte, bool, error)`.
+- Produces: `agentSegment string`, `agentMergeAction`, `agentBlockSpan`, `locateAgentBlocks(existing []byte, path string) ([]agentBlockSpan, error)`, `mergeAgentBlock(existing []byte, path string) ([]byte, agentMergeAction, error)`, and `removeAgentBlock(existing []byte, path string) ([]byte, bool, error)`.
 
 - [ ] **Step 1: Replace the init test helper with a two-file fixture**
 
@@ -252,37 +252,17 @@ func TestAgentDocumentationReferencesUseAgentsMD(t *testing.T) {
 }
 ```
 
-- [ ] **Step 4: Write failing malformed-marker tests**
+- [ ] **Step 4: Write failing complete-span convergence and malformed-marker tests**
 
-Call `cmdInit` directly so the error can be asserted, and verify neither docs nor config were written:
+Add focused tests that drive a complete marker scan rather than a first-match transform:
 
-```go
-func TestCmdInit_ValidatesBothInstructionFilesBeforeWriting(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		files initFiles
-		path  string
-	}{
-		{name: "agents", files: initFiles{agents: stringPtr(agentBeginPrefix + " v:1 -->\nmissing end")}, path: "AGENTS.md"},
-		{name: "claude", files: initFiles{claude: stringPtr(agentBeginPrefix + " v:1 -->\nmissing end")}, path: "CLAUDE.md"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			t.Chdir(dir)
-			writeInitFiles(t, tc.files)
-			cfgPath := filepath.Join(dir, "pgpool.json")
-			rc := &runCtx{client: newClient("http://example"), url: "http://example", cfgPath: cfgPath}
-			err := cmdInit(rc, "http://example", false, true, strings.NewReader(""), io.Discard)
-			if err == nil || !strings.Contains(err.Error(), tc.path) {
-				t.Fatalf("error = %v, want path %s", err, tc.path)
-			}
-			if fileExists(cfgPath) || fileExists("AGENTS.md") != (tc.files.agents != nil) || fileExists("CLAUDE.md") != (tc.files.claude != nil) {
-				t.Fatal("validation failure changed files")
-			}
-		})
-	}
-}
-```
+1. Seed `AGENTS.md` with a current block followed by an old block. Assert the first span becomes/remains the current block, every additional managed span is removed, exactly one begin marker remains, and all bytes outside the spans are byte-for-byte preserved.
+2. Seed `CLAUDE.md` with two managed blocks separated and surrounded by unrelated bytes. Assert every managed span is removed and all unrelated bytes are byte-for-byte preserved.
+3. Seed an instruction file with a valid managed block followed by an unmatched begin marker. Assert `cmdInit` returns an error naming that file before changing the config or either instruction file.
+4. Seed each instruction file with a begin marker nested inside another managed span. Assert `cmdInit` returns an error naming that file before changing the config or either instruction file.
+5. Retain the unmatched-first-begin cases for both files.
+
+Call `cmdInit` directly for validation cases so the error and pre-write file bytes can be asserted. Read both instruction files before the call and compare their bytes afterward in addition to verifying that the config was not created.
 
 - [ ] **Step 5: Run the focused tests and verify RED**
 
@@ -292,7 +272,7 @@ Run:
 go test ./cmd/pgpoolcli -run 'TestCmdInit' -count=1
 ```
 
-Expected: compile failures for undefined `agentSegment` / `agentBeginPrefix`, followed by behavioral failures until implementation exists.
+Expected: compile failures for undefined `agentSegment` / `agentBeginPrefix`, followed by behavioral failures until implementation exists. In the final fix wave, the focused regression run must fail because the second AGENTS/CLAUDE spans survive and trailing/nested begin markers are accepted.
 
 - [ ] **Step 6: Rename marker and merge symbols to neutral agent terminology**
 
@@ -351,23 +331,39 @@ const (
 )
 ```
 
-Implement a shared locator so both transforms report the correct path:
+Implement a shared complete-span locator so both transforms validate the entire file and report the correct path. Each begin marker must have a following end marker before any later begin marker; a later begin before that end is malformed nesting:
 
 ```go
-func locateAgentBlock(existing []byte, path string) (int, int, bool, error) {
-	beginIdx := bytes.Index(existing, []byte(agentBeginPrefix))
-	if beginIdx < 0 {
-		return 0, 0, false, nil
+type agentBlockSpan struct {
+	begin int
+	end   int
+}
+
+func locateAgentBlocks(existing []byte, path string) ([]agentBlockSpan, error) {
+	var spans []agentBlockSpan
+	for offset := 0; ; {
+		beginRel := bytes.Index(existing[offset:], []byte(agentBeginPrefix))
+		if beginRel < 0 {
+			return spans, nil
+		}
+		beginIdx := offset + beginRel
+		contentIdx := beginIdx + len(agentBeginPrefix)
+		endRel := bytes.Index(existing[contentIdx:], []byte(agentEndMarker))
+		if endRel < 0 {
+			return nil, fmt.Errorf("%s has %q without matching %q", path, agentBeginPrefix, agentEndMarker)
+		}
+		endIdx := contentIdx + endRel
+		if nestedRel := bytes.Index(existing[contentIdx:endIdx], []byte(agentBeginPrefix)); nestedRel >= 0 {
+			return nil, fmt.Errorf("%s has nested %q markers", path, agentBeginPrefix)
+		}
+		spanEnd := endIdx + len(agentEndMarker)
+		spans = append(spans, agentBlockSpan{begin: beginIdx, end: spanEnd})
+		offset = spanEnd
 	}
-	endRel := bytes.Index(existing[beginIdx:], []byte(agentEndMarker))
-	if endRel < 0 {
-		return 0, 0, false, fmt.Errorf("%s has %q without matching %q", path, agentBeginPrefix, agentEndMarker)
-	}
-	return beginIdx, beginIdx + endRel + len(agentEndMarker), true, nil
 }
 ```
 
-Refactor the existing merge function as follows:
+Refactor the transforms to consume every span. The AGENTS transform replaces the first span with the current block and removes later spans; the CLAUDE transform removes all spans. Copy only the ranges between spans so every byte outside managed spans is preserved:
 
 ```go
 func mergeAgentBlock(existing []byte, path string) ([]byte, agentMergeAction, error) {
@@ -375,11 +371,11 @@ func mergeAgentBlock(existing []byte, path string) ([]byte, agentMergeAction, er
 		return append([]byte(agentSegment), '\n'), agentCreated, nil
 	}
 
-	beginIdx, endIdx, found, err := locateAgentBlock(existing, path)
+	spans, err := locateAgentBlocks(existing, path)
 	if err != nil {
 		return nil, agentUnchanged, err
 	}
-	if !found {
+	if len(spans) == 0 {
 		var b bytes.Buffer
 		b.Write(existing)
 		if !bytes.HasSuffix(existing, []byte("\n")) {
@@ -390,25 +386,34 @@ func mergeAgentBlock(existing []byte, path string) ([]byte, agentMergeAction, er
 		b.WriteByte('\n')
 		return b.Bytes(), agentAppended, nil
 	}
-	if string(existing[beginIdx:endIdx]) == agentSegment {
+	if len(spans) == 1 && string(existing[spans[0].begin:spans[0].end]) == agentSegment {
 		return existing, agentUnchanged, nil
 	}
 
 	var b bytes.Buffer
-	b.Write(existing[:beginIdx])
+	b.Write(existing[:spans[0].begin])
 	b.WriteString(agentSegment)
-	b.Write(existing[endIdx:])
+	cursor := spans[0].end
+	for _, span := range spans[1:] {
+		b.Write(existing[cursor:span.begin])
+		cursor = span.end
+	}
+	b.Write(existing[cursor:])
 	return b.Bytes(), agentReplaced, nil
 }
 
 func removeAgentBlock(existing []byte, path string) ([]byte, bool, error) {
-	beginIdx, endIdx, found, err := locateAgentBlock(existing, path)
-	if err != nil || !found {
+	spans, err := locateAgentBlocks(existing, path)
+	if err != nil || len(spans) == 0 {
 		return existing, false, err
 	}
 	var b bytes.Buffer
-	b.Write(existing[:beginIdx])
-	b.Write(existing[endIdx:])
+	cursor := 0
+	for _, span := range spans {
+		b.Write(existing[cursor:span.begin])
+		cursor = span.end
+	}
+	b.Write(existing[cursor:])
 	return b.Bytes(), true, nil
 }
 ```
