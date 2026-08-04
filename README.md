@@ -6,7 +6,7 @@ a thin CLI (`pgpoolcli`) for clients. Clients speak HTTP (REST or MCP JSON-RPC);
 the server shells out to `docker`. Designed for multi-agent workflows where
 many agents thrash on features and need isolated, ephemeral infra per worktree.
 
-See `CLAUDE.md` for the full server spec. What follows is how to use it.
+See `AGENTS.md` for the full server spec. What follows is how to use it.
 
 ## Install
 
@@ -65,9 +65,9 @@ Interactive. Prompts for the server URL (press Enter to accept the default /
 existing value, or paste your deployment URL). Then:
 
 1. Creates `~/.config/pgpool/` if missing and writes `pgpool.json` with your URL.
-2. Appends a `pgpool` block to `CLAUDE.md` in the current directory so Claude
-   Code (and other agents that read `CLAUDE.md`) know how to use the CLI.
-   Re-running is a no-op if the block is already present.
+2. Appends a `pgpool` block to `AGENTS.md` in the current directory so agents
+   that read `AGENTS.md` know how to use the CLI. It replaces an older block
+   when needed, and re-running is a no-op when the current block is present.
 
 Non-interactive variants:
 
@@ -165,11 +165,12 @@ human summary:
 pgpoolcli up --json
 ```
 
-## CLAUDE.md integration
+## AGENTS.md integration
 
-Running `pgpoolcli init` in a project appends the block below to `CLAUDE.md`
-(or creates the file). You can also paste it in by hand. The begin/end markers
-make re-running `init` idempotent - it will not duplicate.
+Running `pgpoolcli init` in a project creates or updates `AGENTS.md` with the
+block below. It also migrates and removes a legacy pgpool block from `CLAUDE.md`
+while preserving unrelated content. You can also paste the block in by hand.
+The begin/end markers make re-running `init` idempotent - it will not duplicate.
 
 ```markdown
 <!-- BEGIN PGPOOL INTEGRATION v:4 -->
