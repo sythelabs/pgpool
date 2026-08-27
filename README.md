@@ -53,6 +53,24 @@ Both binaries are `stdlib`-only. No third-party deps.
 clients. Use the Tailscale name / LAN IP that your other machines use to reach
 this host. `localhost` only works for same-machine clients.
 
+### Configuration
+
+| flag | env | default | scope |
+| --- | --- | --- | --- |
+| `--listen` | `PGPOOL_LISTEN` | `:8080` | pgpool HTTP server |
+| `--services` | `PGPOOL_SERVICES` | `postgres` | default service selection |
+| `--advertise-host` | `PGPOOL_ADVERTISE_HOST` | `localhost` | connection URLs |
+| `--image` | `PGPOOL_IMAGE` | `pgvector/pgvector:pg18` | PostgreSQL image |
+| `--pg-user` | `PGPOOL_PG_USER` | `postgres` | PostgreSQL credentials |
+| `--pg-password` | `PGPOOL_PG_PASSWORD` | *(required)* | PostgreSQL credentials |
+| `--pg-db` | `PGPOOL_PG_DB` | `postgres` | PostgreSQL credentials |
+| `--pg-max-connections` | `PGPOOL_PG_MAX_CONNECTIONS` | `100` | PostgreSQL server command |
+| `--docker-bin` | `PGPOOL_DOCKER_BIN` | `docker` | Docker invocation |
+| `--startup-timeout` | | `30s` | readiness probe |
+
+`--pg-max-connections` is passed as `postgres -c max_connections=<n>` when
+pgpool creates a PostgreSQL container. It does not affect other services.
+
 ## Use the CLI
 
 ### First-time setup on a client machine

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -178,6 +179,60 @@ func TestImageFor_UsesConfiguredPostgresImageAndExplicitOverride(t *testing.T) {
 	}
 	if got := s.imageFor(seaweedfsDef, "ignored:tag"); got != "chrislusf/seaweedfs:4.40" {
 		t.Errorf("seaweedfs image = %q", got)
+	}
+}
+
+func TestPostgresCommandUsesConfiguredMaxConnections(t *testing.T) {
+	got := postgresDef.DockerCommand(ServiceBuildCtx{
+		Cfg: Config{PgMaxConnections: 400},
+	})
+	want := []string{"postgres", "-c", "max_connections=400"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("postgres command = %#v, want %#v", got, want)
+	}
+}
+
+func TestPostgresCommandDefaultsMaxConnectionsForZeroValueConfig(t *testing.T) {
+	got := postgresDef.DockerCommand(ServiceBuildCtx{Cfg: Config{}})
+	want := []string{"postgres", "-c", "max_connections=100"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("postgres command = %#v, want %#v", got, want)
+	}
+}
+
+func TestParsePgMaxConnections(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		want  int
+	}{
+		{name: "default", want: defaultPostgresMaxConnections},
+		{name: "explicit", value: "400", want: 400},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parsePgMaxConnections(tc.value)
+			if err != nil {
+				t.Fatalf("parsePgMaxConnections(%q): %v", tc.value, err)
+			}
+			if got != tc.want {
+				t.Errorf("parsePgMaxConnections(%q) = %d, want %d", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPostgresMaxConnectionsRejectsNonPositiveValues(t *testing.T) {
+	for _, value := range []int{0, -1} {
+		if err := validatePgMaxConnections(value); err == nil {
+			t.Fatalf("validatePgMaxConnections(%d) succeeded", value)
+		}
+	}
+}
+
+func TestParsePgMaxConnectionsRejectsNonIntegerValue(t *testing.T) {
+	if _, err := parsePgMaxConnections("not-a-number"); err == nil {
+		t.Fatal("parsePgMaxConnections accepted a non-integer")
 	}
 }
 

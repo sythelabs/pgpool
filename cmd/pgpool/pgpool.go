@@ -112,9 +112,17 @@ type ServiceDef struct {
 var serviceDefs = map[string]ServiceDef{}
 
 const (
-	defaultPostgresImage  = "pgvector/pgvector:pg18"
-	defaultSeaweedfsImage = "chrislusf/seaweedfs:4.40"
+	defaultPostgresImage          = "pgvector/pgvector:pg18"
+	defaultPostgresMaxConnections = 100
+	defaultSeaweedfsImage         = "chrislusf/seaweedfs:4.40"
 )
+
+func postgresMaxConnections(value int) int {
+	if value == 0 {
+		return defaultPostgresMaxConnections
+	}
+	return value
+}
 
 var postgresDef = ServiceDef{
 	Type:            "postgres",
@@ -133,6 +141,9 @@ var postgresDef = ServiceDef{
 			"-e", "POSTGRES_USER=" + bc.Cfg.PgUser,
 			"-e", "POSTGRES_DB=" + bc.Cfg.PgDB,
 		}
+	},
+	DockerCommand: func(bc ServiceBuildCtx) []string {
+		return []string{"postgres", "-c", fmt.Sprintf("max_connections=%d", postgresMaxConnections(bc.Cfg.PgMaxConnections))}
 	},
 	Endpoints: []EndpointSpec{
 		{Role: RolePrimary, ContainerPort: 5432, Scheme: "postgresql"},
@@ -243,15 +254,16 @@ func buildEndpointInfo(bc ServiceBuildCtx, def ServiceDef, hostPorts map[Endpoin
 var serverVersion = "dev"
 
 type Config struct {
-	ListenAddr      string
-	AdvertiseHost   string
-	PgImage         string
-	PgUser          string
-	PgPassword      string
-	PgDB            string
-	StartupTimeout  time.Duration
-	DockerBin       string
-	DefaultServices []string
+	ListenAddr       string
+	AdvertiseHost    string
+	PgImage          string
+	PgUser           string
+	PgPassword       string
+	PgDB             string
+	PgMaxConnections int
+	StartupTimeout   time.Duration
+	DockerBin        string
+	DefaultServices  []string
 }
 
 // dockerExec runs a docker subcommand. Production wraps exec.CommandContext;
@@ -1874,6 +1886,27 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
+func parsePgMaxConnections(value string) (int, error) {
+	if value == "" {
+		return defaultPostgresMaxConnections, nil
+	}
+	maxConnections, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("must be a positive integer, got %q", value)
+	}
+	if err := validatePgMaxConnections(maxConnections); err != nil {
+		return 0, err
+	}
+	return maxConnections, nil
+}
+
+func validatePgMaxConnections(value int) error {
+	if value < 1 {
+		return fmt.Errorf("must be a positive integer, got %d", value)
+	}
+	return nil
+}
+
 // ---------- self-update ----------
 //
 // `pgpool update` reuses the shared selfupdate package, which drives the
@@ -1902,21 +1935,26 @@ func main() {
 	}
 
 	servicesCSV := getenv("PGPOOL_SERVICES", "postgres")
-
+	pgMaxConnections, err := parsePgMaxConnections(os.Getenv("PGPOOL_PG_MAX_CONNECTIONS"))
+	if err != nil {
+		log.Fatalf("pgpool: PGPOOL_PG_MAX_CONNECTIONS: %v", err)
+	}
 	cfg := Config{
-		ListenAddr:     getenv("PGPOOL_LISTEN", ":8080"),
-		AdvertiseHost:  getenv("PGPOOL_ADVERTISE_HOST", "localhost"),
-		PgImage:        getenv("PGPOOL_IMAGE", defaultPostgresImage),
-		PgUser:         getenv("PGPOOL_PG_USER", "postgres"),
-		PgPassword:     os.Getenv("PGPOOL_PG_PASSWORD"),
-		PgDB:           getenv("PGPOOL_PG_DB", "postgres"),
-		DockerBin:      getenv("PGPOOL_DOCKER_BIN", "docker"),
-		StartupTimeout: 30 * time.Second,
+		ListenAddr:       getenv("PGPOOL_LISTEN", ":8080"),
+		AdvertiseHost:    getenv("PGPOOL_ADVERTISE_HOST", "localhost"),
+		PgImage:          getenv("PGPOOL_IMAGE", defaultPostgresImage),
+		PgUser:           getenv("PGPOOL_PG_USER", "postgres"),
+		PgPassword:       os.Getenv("PGPOOL_PG_PASSWORD"),
+		PgDB:             getenv("PGPOOL_PG_DB", "postgres"),
+		PgMaxConnections: pgMaxConnections,
+		DockerBin:        getenv("PGPOOL_DOCKER_BIN", "docker"),
+		StartupTimeout:   30 * time.Second,
 	}
 
 	flag.StringVar(&cfg.ListenAddr, "listen", cfg.ListenAddr, "HTTP listen address")
 	flag.StringVar(&cfg.AdvertiseHost, "advertise-host", cfg.AdvertiseHost, "hostname to include in connection URLs returned to clients")
 	flag.StringVar(&cfg.PgImage, "image", cfg.PgImage, "default postgres image tag")
+	flag.IntVar(&cfg.PgMaxConnections, "pg-max-connections", cfg.PgMaxConnections, "maximum postgres connections")
 	flag.StringVar(&cfg.PgUser, "pg-user", cfg.PgUser, "postgres superuser")
 	flag.StringVar(&cfg.PgPassword, "pg-password", cfg.PgPassword, "postgres superuser password (required)")
 	flag.StringVar(&cfg.PgDB, "pg-db", cfg.PgDB, "default database name")
@@ -1931,6 +1969,10 @@ func main() {
 		return
 	}
 
+	if err := validatePgMaxConnections(cfg.PgMaxConnections); err != nil {
+		log.Fatalf("pgpool: --pg-max-connections: %v", err)
+	}
+
 	if cfg.PgPassword == "" {
 		log.Fatal("pgpool: --pg-password (or PGPOOL_PG_PASSWORD) is required")
 	}
@@ -1939,6 +1981,7 @@ func main() {
 	if len(cfg.DefaultServices) == 0 {
 		log.Fatal("pgpool: --services must be non-empty")
 	}
+
 	for _, name := range cfg.DefaultServices {
 		if _, ok := serviceDefs[name]; !ok {
 			log.Fatalf("pgpool: unknown service %q in --services", name)
