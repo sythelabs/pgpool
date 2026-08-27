@@ -73,18 +73,21 @@ Both are served from the same process on the same port. Choose whichever is conv
 
 Flags (or equivalent env vars). `--pg-password` is the only required field:
 
-| flag               | env                     | default       |
-| ------------------ | ----------------------- | ------------- |
-| `--listen`         | `PGPOOL_LISTEN`         | `:8080`       |
-| `--services`       | `PGPOOL_SERVICES`       | `postgres`    |
-| `--advertise-host` | `PGPOOL_ADVERTISE_HOST` | `localhost`   |
-| `--image`          | `PGPOOL_IMAGE`          | `pgvector/pgvector:pg18` |
-| `--pg-user`        | `PGPOOL_PG_USER`        | `postgres`    |
-| `--pg-password`    | `PGPOOL_PG_PASSWORD`    | *(required)*  |
-| `--pg-db`          | `PGPOOL_PG_DB`          | `postgres`    |
-| `--docker-bin`     | `PGPOOL_DOCKER_BIN`     | `docker`      |
-| `--startup-timeout`|                         | `30s`         |
+| flag | env | default | scope |
+| --- | --- | --- | --- |
+| `--listen` | `PGPOOL_LISTEN` | `:8080` | pgpool HTTP server |
+| `--services` | `PGPOOL_SERVICES` | `postgres` | default service selection |
+| `--advertise-host` | `PGPOOL_ADVERTISE_HOST` | `localhost` | connection URLs |
+| `--image` | `PGPOOL_IMAGE` | `pgvector/pgvector:pg18` | PostgreSQL image |
+| `--pg-user` | `PGPOOL_PG_USER` | `postgres` | PostgreSQL credentials |
+| `--pg-password` | `PGPOOL_PG_PASSWORD` | *(required)* | PostgreSQL credentials |
+| `--pg-db` | `PGPOOL_PG_DB` | `postgres` | PostgreSQL credentials |
+| `--pg-max-connections` | `PGPOOL_PG_MAX_CONNECTIONS` | `100` | PostgreSQL server command |
+| `--docker-bin` | `PGPOOL_DOCKER_BIN` | `docker` | Docker invocation |
+| `--startup-timeout` | | `30s` | service readiness |
 
+`--pg-max-connections` is passed as Postgres's `max_connections` server setting
+when pgpool creates a PostgreSQL container. It does not affect other services.
 `--advertise-host` is the hostname written into URLs returned to clients. Set it to the Tailscale name / LAN IP that remote clients use to reach Postgres. `localhost` only works for same-machine clients.
 
 ## Running
