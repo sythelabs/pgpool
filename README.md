@@ -43,6 +43,14 @@ go build -o pgpoolcli ./cmd/pgpoolcli
 
 Both binaries are `stdlib`-only. No third-party deps.
 
+The registered `release.yml` workflow builds both binaries for five cross-compile
+targets: Linux amd64/arm64, macOS amd64/arm64, and Windows amd64. Authorized
+repository Actions-write operators can run it manually against a reviewed branch
+without publishing a release; archive names and embedded versions retain the
+actual source ref, including branch-name path separators. These are cross-builds,
+not native-platform runtime tests. The separate `publish.yml` workflow publishes
+only on real `v*` tag pushes after the same reusable build succeeds.
+
 ## Run the server
 
 ```
