@@ -17,9 +17,17 @@ jobs:
     needs: build
     runs-on: >-
       ${{ fromJSON(github.repository == 'sythelabs/pgpool' &&
+      github.event.repository.private &&
       github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
       '["self-hosted","ci"]' || '["ubuntu-latest"]') }}
     steps:
+      - name: Prepare job-private tool home
+        run: |
+          set -euo pipefail
+          tool_home="$RUNNER_TEMP/tool-home"
+          mkdir -p "$tool_home/.config"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s\n' "$tool_home" "$tool_home/.config" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
