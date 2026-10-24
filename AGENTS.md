@@ -140,3 +140,29 @@ curl -s -X POST localhost:8080/mcp \
 - The pg superuser password is shared across all containers. Acceptable because the server and Postgres are only reachable on a trusted network.
 - No auth on the HTTP endpoint in v1. **Do not expose the port to the public internet.**
 - Labels are trusted. `list` filters by label; anything else labelled `pgpool=true` will show up and be eligible for `down`. Do not hand-label unrelated containers with `pgpool=true`.
+
+## Prefer Cloudflare's platform over hand-written implementations
+
+This service runs on Cloudflare. Before writing code for something the platform already does, use the
+platform. Never hand-roll a scheduler, queue, retry loop, lock, blob store or configuration loader.
+
+- periodic work -> **Cron Triggers** (`scheduled()`), never a daemon, timer loop or "scheduler" service
+- async work, fan-out, retries, backoff, dead-letter -> **Cloudflare Queues**, never Redis/bullmq and never
+  hand-written retry code
+- state and locking -> the rows you already have (Postgres `SELECT ... FOR UPDATE SKIP LOCKED`), not a separate
+  lock service
+- long, multi-step or resumable work -> **Workflows**; durable coordination -> **Durable Objects**
+- objects and large payloads -> **R2**; small hot reads -> **KV** or the Cache API
+- configuration and secrets -> Worker vars and secrets, not a bespoke loader
+- tests -> the Workers test pool, not hand-rolled platform mocks
+
+Prefer an official Cloudflare binding or client library over a hand-written client, and name the library in the PR
+body. A supported adapter beats custom glue; when an adapter is third-party rather than first-party (for example
+OpenNext for Next.js on Workers), say so plainly instead of implying it is native.
+
+If, and only if, there is genuinely no native option, the glue you write must be declared in the PR body as
+`custom - why there was no native option`. No silent custom layers.
+
+Design to the real limits: a Queue consumer and a Cron Trigger each get 15 minutes of wall time, CPU is capped
+(configurable up to 5 minutes), and a single request may hold only 6 simultaneous outgoing connections with 128 MB
+of memory. Fan work out across messages and let the platform supply the concurrency.
