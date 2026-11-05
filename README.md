@@ -51,11 +51,11 @@ actual source ref, including branch-name path separators. These are cross-builds
 not native-platform runtime tests. The separate `publish.yml` workflow publishes
 only on real `v*` tag pushes after the same reusable build succeeds.
 
-Release builds use the `[self-hosted, ci]` runner pool only when the repository
-is private and the run is a `v*` tag push or a manual dispatch. This repository
-is public, so every context currently uses the GitHub-hosted `ubuntu-latest`
-fallback. Self-hosted jobs run with a job-private HOME under `RUNNER_TEMP`
-because the runner user is persistent.
+The repository is public. The release build runs only in `sythelabs/pgpool` for
+`v*` tag pushes or manual dispatches; publishing runs only for `v*` tag pushes.
+Both use `[self-hosted, ci]`. Other contexts are skipped, never sent to a
+GitHub-hosted fallback. Each job uses a job-private HOME because the runner user
+is persistent.
 
 ## Run the server
 
