@@ -18,7 +18,7 @@ jobs:
     if: >-
       github.repository == 'sythelabs/pgpool' &&
       github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, ci5]
     steps:
       - name: Prepare job-private tool home
         run: |

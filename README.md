@@ -53,8 +53,9 @@ only on real `v*` tag pushes after the same reusable build succeeds.
 
 The repository is public. The release build runs only in `sythelabs/pgpool` for
 `v*` tag pushes or manual dispatches; publishing runs only for `v*` tag pushes.
-Both use `[self-hosted, ci]`. Other contexts are skipped, never sent to a
-GitHub-hosted fallback. Each job uses a job-private HOME because the runner user
+Both use `[self-hosted, ci5]`, reserved in the `pgpool-public` runner group.
+Neither workflow runs on pull requests, including those from forks. Other
+contexts are skipped. Each job uses a job-private HOME because the runner user
 is persistent.
 
 ## Run the server
