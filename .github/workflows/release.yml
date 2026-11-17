@@ -50,7 +50,7 @@ jobs:
       - name: Check release tool prerequisites
         run: |
           set -euo pipefail
-          for tool in tar zip sha256sum; do
+          for tool in tar python3 sha256sum; do
             command -v "$tool"
           done
 
@@ -89,7 +89,7 @@ jobs:
           BASENAME="pgpool-${VERSION}-${GOOS}-${GOARCH}"
           cd dist
           if [ "$GOOS" = "windows" ]; then
-            zip -r "${BASENAME}.zip" "${BASENAME}"
+            python3 -m zipfile -c "${BASENAME}.zip" "${BASENAME}"
             echo "asset=dist/${BASENAME}.zip" >> "$GITHUB_OUTPUT"
           else
             tar -czf "${BASENAME}.tar.gz" "${BASENAME}"
