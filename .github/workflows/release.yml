@@ -10,12 +10,11 @@ permissions:
 jobs:
   build:
     name: build ${{ matrix.goos }}/${{ matrix.goarch }}
-    runs-on: >-
-      ${{ fromJSON(github.repository == 'sythelabs/pgpool' &&
-      github.event.repository.private &&
+    runs-on: [self-hosted, ci5]
+    if: >-
+      github.repository == 'sythelabs/pgpool' &&
       ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-      github.event_name == 'workflow_dispatch') &&
-      '["self-hosted","ci"]' || '["ubuntu-latest"]') }}
+      github.event_name == 'workflow_dispatch')
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +35,7 @@ jobs:
       - name: Prepare job-private tool home
         run: |
           set -euo pipefail
-          tool_home="$RUNNER_TEMP/tool-home"
+          tool_home="$(mktemp -d "$RUNNER_TEMP/pgpool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
           mkdir -p "$tool_home/.config"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s\nXDG_CACHE_HOME=%s\nGOPATH=%s\nGOCACHE=%s\n' \
             "$tool_home" "$tool_home/.config" "$tool_home/.cache" \
@@ -51,10 +50,9 @@ jobs:
       - name: Check release tool prerequisites
         run: |
           set -euo pipefail
-          for tool in gh tar zip sha256sum; do
+          for tool in tar python3 sha256sum; do
             command -v "$tool"
           done
-          gh --version
 
       - name: build
         env:
@@ -91,7 +89,7 @@ jobs:
           BASENAME="pgpool-${VERSION}-${GOOS}-${GOARCH}"
           cd dist
           if [ "$GOOS" = "windows" ]; then
-            zip -r "${BASENAME}.zip" "${BASENAME}"
+            python3 -m zipfile -c "${BASENAME}.zip" "${BASENAME}"
             echo "asset=dist/${BASENAME}.zip" >> "$GITHUB_OUTPUT"
           else
             tar -czf "${BASENAME}.tar.gz" "${BASENAME}"
@@ -104,3 +102,7 @@ jobs:
           path: ${{ steps.archive.outputs.asset }}
           if-no-files-found: error
           retention-days: 1
+
+      - name: Remove job-private tool home
+        if: ${{ always() }}
+        run: rm -rf "$RUNNER_TEMP"/pgpool-"${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"-*
