@@ -23,9 +23,18 @@ jobs:
       - name: Prepare job-private tool home
         run: |
           set -euo pipefail
-          tool_home="$RUNNER_TEMP/tool-home"
+          tool_home="$(mktemp -d "$RUNNER_TEMP/pgpool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
           mkdir -p "$tool_home/.config"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s\n' "$tool_home" "$tool_home/.config" >> "$GITHUB_ENV"
+
+      - name: Install GitHub CLI in the job-private home
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            https://github.com/cli/cli/releases/download/v2.104.0/gh_2.104.0_linux_amd64.tar.gz \
+            | tar -xz -C "$HOME/bin" --strip-components=2 gh_2.104.0_linux_amd64/bin/gh
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v4
 
@@ -51,3 +60,7 @@ jobs:
             --title "$VERSION" \
             --generate-notes \
             dist/pgpool-*.tar.gz dist/pgpool-*.zip dist/SHA256SUMS
+
+      - name: Remove job-private tool home
+        if: ${{ always() }}
+        run: rm -rf "$RUNNER_TEMP"/pgpool-"${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"-*

@@ -35,7 +35,7 @@ jobs:
       - name: Prepare job-private tool home
         run: |
           set -euo pipefail
-          tool_home="$RUNNER_TEMP/tool-home"
+          tool_home="$(mktemp -d "$RUNNER_TEMP/pgpool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
           mkdir -p "$tool_home/.config"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s\nXDG_CACHE_HOME=%s\nGOPATH=%s\nGOCACHE=%s\n' \
             "$tool_home" "$tool_home/.config" "$tool_home/.cache" \
@@ -50,10 +50,9 @@ jobs:
       - name: Check release tool prerequisites
         run: |
           set -euo pipefail
-          for tool in gh tar zip sha256sum; do
+          for tool in tar zip sha256sum; do
             command -v "$tool"
           done
-          gh --version
 
       - name: build
         env:
@@ -103,3 +102,7 @@ jobs:
           path: ${{ steps.archive.outputs.asset }}
           if-no-files-found: error
           retention-days: 1
+
+      - name: Remove job-private tool home
+        if: ${{ always() }}
+        run: rm -rf "$RUNNER_TEMP"/pgpool-"${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"-*
